@@ -79,25 +79,44 @@ app.get('/api/gaskets', async (req, res) => {
   try {
     const {
       material_group, location, responsible_person, status,
-      start_date, end_date, wear_level,
+      start_date, end_date, date_type = 'created',
+      wear_level,
       page = 1, page_size = 50
     } = req.query;
+
+    const validDateTypes = ['created', 'wear', 'borrow', 'cleaning'];
+    const actualDateType = validDateTypes.includes(date_type) ? date_type : 'created';
 
     let sql = `SELECT DISTINCT g.* FROM gaskets g`;
     const conditions = [];
     const params = [];
 
-    if (wear_level) {
+    if (actualDateType === 'wear' || wear_level) {
       sql += ` LEFT JOIN wear_records w ON g.id = w.gasket_id`;
+    }
+    if (actualDateType === 'borrow') {
+      sql += ` LEFT JOIN borrow_records b ON g.id = b.gasket_id`;
+    }
+    if (actualDateType === 'cleaning') {
+      sql += ` LEFT JOIN cleaning_records c ON g.id = c.gasket_id`;
     }
 
     if (material_group) { conditions.push('g.material_group = ?'); params.push(material_group); }
     if (location) { conditions.push('g.location = ?'); params.push(location); }
     if (responsible_person) { conditions.push('g.responsible_person = ?'); params.push(responsible_person); }
     if (status) { conditions.push('g.status = ?'); params.push(status); }
-    if (start_date) { conditions.push('g.created_at >= ?'); params.push(start_date); }
-    if (end_date) { conditions.push('g.created_at <= ?'); params.push(end_date + ' 23:59:59'); }
     if (wear_level) { conditions.push('w.wear_level = ?'); params.push(Number(wear_level)); }
+
+    if (start_date || end_date) {
+      const dateField = {
+        created: 'g.created_at',
+        wear: 'w.wear_date',
+        borrow: 'b.borrow_date',
+        cleaning: 'c.cleaning_date'
+      }[actualDateType];
+      if (start_date) { conditions.push(`${dateField} >= ?`); params.push(start_date); }
+      if (end_date) { conditions.push(`${dateField} <= ?`); params.push(end_date + ' 23:59:59'); }
+    }
 
     if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
     sql += ' ORDER BY g.updated_at DESC';
@@ -109,7 +128,7 @@ app.get('/api/gaskets', async (req, res) => {
     const listSql = sql + ` LIMIT ? OFFSET ?`;
     const listParams = [...params, Number(page_size), offset];
     const list = await db.allAsync(listSql, listParams);
-    res.json({ code: 0, message: 'ok', data: { list, total, page: Number(page), page_size: Number(page_size) } });
+    res.json({ code: 0, message: 'ok', data: { list, total, page: Number(page), page_size: Number(page_size), date_type: actualDateType } });
   } catch (e) {
     res.json({ code: 500, message: e.message });
   }
@@ -133,6 +152,16 @@ app.put('/api/gaskets/:id', async (req, res) => {
 
     if (status && !VALID_STATUSES.includes(status)) {
       return res.json({ code: 400, message: `无效状态，允许值: ${VALID_STATUSES.join(', ')}` });
+    }
+
+    if (status && current.status === '磨损观察' && status === '恢复可用') {
+      return res.json({ code: 409, message: '校验失败: 处于磨损观察中的垫片不得直接恢复可用，请先完成清洁流程' });
+    }
+    if (status && current.status === '使用中' && status !== '待清洁' && status !== '使用中') {
+      return res.json({ code: 409, message: `校验失败: 垫片「${current.gasket_no}」正在使用中，不可直接切换为「${status}」，请先通过归还接口流转` });
+    }
+    if (status && current.status === '待复查' && status !== '磨损观察' && status !== '待复查' && status !== '恢复可用') {
+      return res.json({ code: 409, message: `校验失败: 垫片「${current.gasket_no}」处于待复查状态，请先通过复查接口闭环` });
     }
 
     await db.runAsync(
@@ -265,6 +294,16 @@ app.post('/api/cleanings', async (req, res) => {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
 
+    if (gasket.status === '磨损观察') {
+      return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」处于磨损观察期，不得直接清洁恢复，请先通过复查接口完成闭环` });
+    }
+    if (gasket.status === '待复查') {
+      return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」存在待复查事项，不得直接清洁恢复，请先通过复查接口闭环` });
+    }
+    if (gasket.status === '使用中') {
+      return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」正在使用中，请先通过归还接口登记归还后再清洁` });
+    }
+
     const d = parseDate(cleaning_date);
     if (!d) return res.json({ code: 400, message: 'cleaning_date 格式无效' });
     d.setDate(d.getDate() + Number(gasket.cleaning_cycle));
@@ -388,12 +427,18 @@ app.post('/api/wears', async (req, res) => {
       }
       const original = await db.getAsync('SELECT * FROM wear_records WHERE id = ?', [original_record_id]);
       if (!original) return res.json({ code: 404, message: '关联的原磨损记录不存在' });
+      if (original.gasket_id != gasket_id) {
+        return res.json({ code: 400, message: `校验失败: 原磨损记录 ID=${original_record_id} 属于垫片 ${original.gasket_no}(id=${original.gasket_id})，与当前垫片 ${gasket.gasket_no}(id=${gasket_id}) 不匹配` });
+      }
 
       if (!replacement_gasket_id) {
         return res.json({ code: 400, message: '临时替换必须提供替换垫片 ID (replacement_gasket_id)' });
       }
       const replacement = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [replacement_gasket_id]);
       if (!replacement) return res.json({ code: 404, message: '替换垫片不存在' });
+      if (String(replacement_gasket_id) === String(gasket_id)) {
+        return res.json({ code: 409, message: '校验失败: 替换垫片不可与原垫片为同一只' });
+      }
       if (replacement.status !== '待领出' && replacement.status !== '恢复可用') {
         return res.json({ code: 409, message: `替换垫片 ${replacement.gasket_no} 状态为 ${replacement.status}，不可用于替换` });
       }
