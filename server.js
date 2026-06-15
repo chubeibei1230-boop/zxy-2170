@@ -12,7 +12,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const VALID_STATUSES = ['待领出', '使用中', '待清洁', '待复查', '恢复可用', '磨损观察'];
+const VALID_STATUSES = ['待领出', '使用中', '待清洁', '待复查', '恢复可用', '磨损观察', '已报废'];
 
 const VALID_ORDER_STATUSES = ['待处理', '处理中', '已完成'];
 const VALID_RISK_TYPES = ['高等级磨损', '清洁逾期', '复查逾期', '频繁临时替换'];
@@ -89,7 +89,7 @@ app.post('/api/gaskets', async (req, res) => {
 app.get('/api/gaskets', async (req, res) => {
   try {
     const {
-      material_group, location, responsible_person, status,
+      gasket_no, material_group, location, responsible_person, status,
       start_date, end_date, date_type = 'created',
       wear_level,
       page = 1, page_size = 50
@@ -116,6 +116,7 @@ app.get('/api/gaskets', async (req, res) => {
     if (location) { conditions.push('g.location = ?'); params.push(location); }
     if (responsible_person) { conditions.push('g.responsible_person = ?'); params.push(responsible_person); }
     if (status) { conditions.push('g.status = ?'); params.push(status); }
+    if (gasket_no) { conditions.push('g.gasket_no LIKE ?'); params.push(`%${gasket_no}%`); }
     if (wear_level) { conditions.push('w.wear_level = ?'); params.push(Number(wear_level)); }
 
     if (start_date || end_date) {
@@ -191,6 +192,10 @@ app.put('/api/gaskets/:id', async (req, res) => {
     const current = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [req.params.id]);
     if (!current) return res.json({ code: 404, message: '垫片不存在' });
 
+    const scrappedGasket = await isGasketScrapped(req.params.id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '变更状态');
+    if (scrappedErr) return res.json(scrappedErr);
+
     if (current.is_deactivated === 1 && status) {
       const activeException = await hasActiveException(req.params.id);
       if (activeException) {
@@ -254,6 +259,10 @@ app.post('/api/borrows', async (req, res) => {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
 
+    const scrappedGasket = await isGasketScrapped(gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '领用');
+    if (scrappedErr) return res.json(scrappedErr);
+
     if (gasket.is_deactivated === 1) {
       const activeException = await hasActiveException(gasket_id);
       return res.json({
@@ -301,6 +310,10 @@ app.post('/api/borrows/:id/return', async (req, res) => {
     const record = await db.getAsync('SELECT * FROM borrow_records WHERE id = ?', [req.params.id]);
     if (!record) return res.json({ code: 404, message: '领用记录不存在' });
     if (record.return_date) return res.json({ code: 409, message: '该领用记录已归还' });
+
+    const scrappedGasket = await isGasketScrapped(record.gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '归还');
+    if (scrappedErr) return res.json(scrappedErr);
 
     await db.runAsync(
       `UPDATE borrow_records SET return_date = ?, return_location = ?, remarks = COALESCE(?, remarks) WHERE id = ?`,
@@ -355,9 +368,21 @@ app.post('/api/cleanings', async (req, res) => {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
 
-    if (gasket.is_deactivated === 1) {
-      const activeException = await hasActiveException(gasket_id);
-      if (activeException && activeException.exception_type !== '清洁超期') {
+    const scrappedGasket = await isGasketScrapped(gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '清洁');
+    if (scrappedErr) return res.json(scrappedErr);
+
+    const activeException = await hasActiveException(gasket_id);
+    const isHighWearProcessing = gasket.is_deactivated === 1 && 
+      activeException?.exception_type === '高等级磨损' &&
+      activeException?.status === '处理中';
+
+    if (gasket.is_deactivated === 1 && activeException) {
+      if (activeException.exception_type === '清洁超期') {
+        // 清洁超期异常允许清洁
+      } else if (isHighWearProcessing) {
+        // 处理中的高等级磨损异常允许清洁（恢复前置条件），跳过状态检查
+      } else {
         return res.json({
           code: 409,
           message: `校验失败: 垫片 ${gasket.gasket_no} 因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，请先通过异常处置流程处理`
@@ -365,12 +390,15 @@ app.post('/api/cleanings', async (req, res) => {
       }
     }
 
-    if (gasket.status === '磨损观察') {
-      return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」处于磨损观察期，不得直接清洁恢复，请先通过复查接口完成闭环` });
+    if (!isHighWearProcessing) {
+      if (gasket.status === '磨损观察') {
+        return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」处于磨损观察期，不得直接清洁恢复，请先通过复查接口完成闭环` });
+      }
+      if (gasket.status === '待复查') {
+        return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」存在待复查事项，不得直接清洁恢复，请先通过复查接口闭环` });
+      }
     }
-    if (gasket.status === '待复查') {
-      return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」存在待复查事项，不得直接清洁恢复，请先通过复查接口闭环` });
-    }
+    
     if (gasket.status === '使用中') {
       return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」正在使用中，请先通过归还接口登记归还后再清洁` });
     }
@@ -492,6 +520,10 @@ app.post('/api/wears', async (req, res) => {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
 
+    const scrappedGasket = await isGasketScrapped(gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '登记磨损');
+    if (scrappedErr) return res.json(scrappedErr);
+
     if (gasket.is_deactivated === 1) {
       const activeException = await hasActiveException(gasket_id);
       if (activeException && activeException.exception_type !== '高等级磨损') {
@@ -520,6 +552,11 @@ app.post('/api/wears', async (req, res) => {
       if (String(replacement_gasket_id) === String(gasket_id)) {
         return res.json({ code: 409, message: '校验失败: 替换垫片不可与原垫片为同一只' });
       }
+      
+      const scrappedReplacement = await isGasketScrapped(replacement_gasket_id);
+      const scrappedErr = checkScrappedError(scrappedReplacement, '用于替换');
+      if (scrappedErr) return res.json(scrappedErr);
+      
       if (replacement.is_deactivated === 1) {
         const activeException = await hasActiveException(replacement_gasket_id);
         return res.json({
@@ -619,6 +656,10 @@ app.post('/api/reviews', async (req, res) => {
 
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    const scrappedGasket = await isGasketScrapped(gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '复查');
+    if (scrappedErr) return res.json(scrappedErr);
 
     const wear = await db.getAsync('SELECT * FROM wear_records WHERE id = ?', [wear_record_id]);
     if (!wear) return res.json({ code: 404, message: '磨损记录不存在' });
@@ -1467,6 +1508,21 @@ async function hasActiveException(gasketId) {
   return result || null;
 }
 
+async function isGasketScrapped(gasketId) {
+  const gasket = await db.getAsync('SELECT is_scrapped, gasket_no FROM gaskets WHERE id = ?', [gasketId]);
+  return gasket && gasket.is_scrapped === 1 ? gasket : null;
+}
+
+function checkScrappedError(scrappedGasket, operation = '操作') {
+  if (scrappedGasket) {
+    return {
+      code: 409,
+      message: `校验失败: 垫片「${scrappedGasket.gasket_no}」已报废，不可${operation}`
+    };
+  }
+  return null;
+}
+
 async function setGasketDeactivated(gasketId, deactivated) {
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   await db.runAsync(
@@ -1563,6 +1619,10 @@ app.post('/api/exceptions', async (req, res) => {
 
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    const scrappedGasket = await isGasketScrapped(gasket_id);
+    const scrappedErr = checkScrappedError(scrappedGasket, '发起异常停用');
+    if (scrappedErr) return res.json(scrappedErr);
 
     const activeException = await hasActiveException(gasket_id);
     if (activeException) {
@@ -1665,10 +1725,11 @@ app.get('/api/exceptions', async (req, res) => {
     }
 
     if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
-    sql += ' ORDER BY e.created_at DESC';
-
-    const countSql = sql.replace('SELECT e.*, g.location, g.material_group, g.responsible_person, g.is_deactivated, CASE WHEN e.status IN (\'待处理\', \'处理中\') AND e.processing_deadline IS NOT NULL AND e.processing_deadline < datetime(\'now\', \'localtime\') THEN 1 ELSE 0 END as is_overdue', 'SELECT COUNT(*) as cnt');
+    
+    const countSql = sql.replace(/^SELECT[\s\S]*?FROM/, 'SELECT COUNT(*) as cnt FROM');
     const total = (await db.getAsync(countSql, params)).cnt;
+    
+    sql += ' ORDER BY e.created_at DESC';
 
     const offset = (Number(page) - 1) * Number(page_size);
     const listSql = sql + ` LIMIT ? OFFSET ?`;
@@ -1801,7 +1862,18 @@ app.put('/api/exceptions/:id/status', async (req, res) => {
         [status, operator, actual_disposal, disposal_result || '已报废', completedAt, remarks, req.params.id]
       );
 
-      await setGasketDeactivated(exception.gasket_id, true);
+      const scrappedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      await db.runAsync(
+        `UPDATE gaskets SET
+          is_deactivated = 1,
+          deactivated_at = ?,
+          is_scrapped = 1,
+          scrapped_at = ?,
+          status = '已报废',
+          updated_at = datetime('now', 'localtime')
+        WHERE id = ?`,
+        [scrappedAt, scrappedAt, exception.gasket_id]
+      );
     } else if (status === '已取消') {
       const completedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
       await db.runAsync(
@@ -2122,6 +2194,7 @@ app.get('/api/stats/overview', async (req, res) => {
 
     const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
     const deactivatedCount = (await db.getAsync("SELECT COUNT(*) as cnt FROM gaskets WHERE is_deactivated = 1")).cnt;
+    const scrappedCount = (await db.getAsync("SELECT COUNT(*) as cnt FROM gaskets WHERE is_scrapped = 1")).cnt;
     const activeExceptionCount = (await db.getAsync(
       `SELECT COUNT(*) as cnt FROM exception_orders WHERE status IN ('待处理', '处理中')`
     )).cnt;
@@ -2150,6 +2223,7 @@ app.get('/api/stats/overview', async (req, res) => {
           active_borrow: activeBorrow,
           pending_review: pendingReview,
           deactivated_gaskets: deactivatedCount,
+          scrapped_gaskets: scrappedCount,
           active_exceptions: activeExceptionCount,
           overdue_exceptions: overdueExceptionCount
         },

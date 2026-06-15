@@ -42,6 +42,8 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT '待领出',
       is_deactivated INTEGER NOT NULL DEFAULT 0,
       deactivated_at TEXT,
+      is_scrapped INTEGER NOT NULL DEFAULT 0,
+      scrapped_at TEXT,
       last_cleaning_date TEXT,
       next_cleaning_date TEXT,
       created_at TEXT DEFAULT (datetime('now', 'localtime')),

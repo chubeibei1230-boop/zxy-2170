@@ -88,6 +88,7 @@ async function loadOverview() {
       const d = overviewData.data.summary;
       document.getElementById('stat-total-gaskets').textContent = d.total_gaskets;
       document.getElementById('stat-active-borrow').textContent = d.active_borrow;
+      document.getElementById('stat-scrapped').textContent = d.scrapped_gaskets || 0;
       document.getElementById('stat-deactivated').textContent = d.deactivated_gaskets;
       document.getElementById('stat-active-exceptions').textContent = d.active_exceptions;
       document.getElementById('stat-overdue-exceptions').textContent = d.overdue_exceptions;
@@ -390,20 +391,38 @@ async function loadGasketForSelect(gasketId) {
 
 async function searchGasket() {
   const keyword = document.getElementById('search-gasket').value.trim();
-  if (!keyword) return;
+  if (!keyword) {
+    showAlert('请输入垫片编号', 'danger');
+    return;
+  }
 
   try {
-    const res = await fetch(`${API_BASE}/gaskets?gasket_no=${keyword}`);
+    const res = await fetch(`${API_BASE}/gaskets?gasket_no=${encodeURIComponent(keyword)}`);
     const data = await res.json();
     if (data.code === 0 && data.data.list.length > 0) {
-      const gasket = data.data.list[0];
+      const exactMatch = data.data.list.find(g => g.gasket_no.toLowerCase() === keyword.toLowerCase());
+      const gasket = exactMatch || data.data.list[0];
+      
+      if (gasket.is_scrapped) {
+        document.getElementById('create-gasket-id').value = '';
+        document.getElementById('create-gasket-no').value = '';
+        showAlert(`该垫片「${gasket.gasket_no}」已报废，不可发起异常停用`, 'danger');
+        return;
+      }
+      
       document.getElementById('create-gasket-id').value = gasket.id;
       document.getElementById('create-gasket-no').value = gasket.gasket_no;
+      if (gasket.has_active_exception) {
+        showAlert(`该垫片存在未完成异常: ${gasket.active_exception.exception_no}，不可重复发起`, 'warning');
+      }
     } else {
-      showAlert('未找到该垫片', 'danger');
+      document.getElementById('create-gasket-id').value = '';
+      document.getElementById('create-gasket-no').value = '';
+      showAlert('未找到该垫片，请确认编号是否正确', 'danger');
     }
   } catch (e) {
     console.error('搜索垫片失败:', e);
+    showAlert('搜索失败: ' + e.message, 'danger');
   }
 }
 
@@ -598,18 +617,19 @@ function renderGasketList() {
       <td>${getStatusBadge(item.status)}</td>
       <td>${item.responsible_person}</td>
       <td>
-        ${item.is_deactivated ? '<span class="badge badge-exception">已停用</span>' : ''}
+        ${item.is_scrapped ? '<span class="badge badge-status-scrapped">已报废</span>' : ''}
+        ${item.is_deactivated && !item.is_scrapped ? '<span class="badge badge-exception">已停用</span>' : ''}
         ${item.has_active_exception ? `<span class="badge badge-overdue">存在异常</span>` : ''}
       </td>
       <td>${formatDate(item.updated_at)}</td>
       <td>
         <div class="action-buttons">
           <button class="btn btn-sm btn-secondary" onclick="viewGasket(${item.id})">详情</button>
-          ${item.has_active_exception ? `
+          ${item.is_scrapped ? '' : (item.has_active_exception ? `
             <button class="btn btn-sm btn-primary" onclick="viewException(${item.active_exception.exception_id})">查看异常</button>
           ` : `
             <button class="btn btn-sm btn-warning" onclick="openCreateModal(${item.id})">发起停用</button>
-          `}
+          `)}
         </div>
       </td>
     </tr>
@@ -651,7 +671,15 @@ function renderGasketDetail() {
   document.getElementById('gasket-detail-created').textContent = formatDate(g.created_at);
 
   const exceptionBanner = document.getElementById('gasket-exception-banner');
-  if (g.has_active_exception) {
+  if (g.is_scrapped) {
+    exceptionBanner.style.display = 'flex';
+    exceptionBanner.innerHTML = `
+      <div class="info">
+        <span class="title">⚠️ 该垫片已报废</span>
+        <span class="desc">报废时间: ${formatDate(g.scrapped_at)}，永久不可使用</span>
+      </div>
+    `;
+  } else if (g.has_active_exception) {
     exceptionBanner.style.display = 'flex';
     exceptionBanner.innerHTML = `
       <div class="info">
@@ -674,7 +702,11 @@ function renderGasketDetail() {
   }
 
   const actionBtnEl = document.getElementById('gasket-detail-actions');
-  if (g.has_active_exception) {
+  if (g.is_scrapped) {
+    actionBtnEl.innerHTML = `
+      <button class="btn btn-secondary" onclick="hideModal('gasket-detail-modal')">关闭</button>
+    `;
+  } else if (g.has_active_exception) {
     actionBtnEl.innerHTML = `
       <button class="btn btn-secondary" onclick="hideModal('gasket-detail-modal')">关闭</button>
       <button class="btn btn-primary" onclick="hideModal('gasket-detail-modal'); viewException(${g.exception_id})">查看异常</button>
