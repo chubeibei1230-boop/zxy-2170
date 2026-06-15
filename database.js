@@ -40,6 +40,8 @@ async function initDatabase() {
       cleaning_cycle INTEGER NOT NULL DEFAULT 7,
       responsible_person TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT '待领出',
+      is_deactivated INTEGER NOT NULL DEFAULT 0,
+      deactivated_at TEXT,
       last_cleaning_date TEXT,
       next_cleaning_date TEXT,
       created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -164,6 +166,50 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_work_order_responsible ON risk_work_orders(responsible_person);
     CREATE INDEX IF NOT EXISTS idx_work_order_gasket ON risk_work_orders(gasket_id);
     CREATE INDEX IF NOT EXISTS idx_work_order_log_order ON risk_work_order_logs(order_id);
+
+    CREATE TABLE IF NOT EXISTS exception_orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      exception_no TEXT UNIQUE NOT NULL,
+      gasket_id INTEGER NOT NULL,
+      gasket_no TEXT NOT NULL,
+      exception_type TEXT NOT NULL,
+      trigger_reason TEXT NOT NULL,
+      initiator TEXT NOT NULL,
+      exception_description TEXT,
+      suggested_disposal TEXT,
+      processing_deadline TEXT,
+      status TEXT NOT NULL DEFAULT '待处理',
+      actual_disposal TEXT,
+      disposal_result TEXT,
+      preconditions_met INTEGER DEFAULT 0,
+      precondition_details TEXT,
+      operator TEXT,
+      completed_at TEXT,
+      related_record_type TEXT,
+      related_record_id INTEGER,
+      remarks TEXT,
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (gasket_id) REFERENCES gaskets(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS exception_order_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      exception_order_id INTEGER NOT NULL,
+      action_type TEXT NOT NULL,
+      operator TEXT NOT NULL,
+      old_status TEXT,
+      new_status TEXT,
+      content TEXT,
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (exception_order_id) REFERENCES exception_orders(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_exception_order_status ON exception_orders(status);
+    CREATE INDEX IF NOT EXISTS idx_exception_order_type ON exception_orders(exception_type);
+    CREATE INDEX IF NOT EXISTS idx_exception_order_gasket ON exception_orders(gasket_id);
+    CREATE INDEX IF NOT EXISTS idx_exception_order_deadline ON exception_orders(processing_deadline);
+    CREATE INDEX IF NOT EXISTS idx_exception_order_log_order ON exception_order_logs(exception_order_id);
   `;
 
   await db.execAsync(initSql);

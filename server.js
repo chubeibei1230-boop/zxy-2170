@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const path = require('path');
 const { db, initDatabase, DB_PATH } = require('./database');
 
 const app = express();
@@ -9,12 +10,18 @@ const PORT = 8126;
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
 const VALID_STATUSES = ['待领出', '使用中', '待清洁', '待复查', '恢复可用', '磨损观察'];
 
 const VALID_ORDER_STATUSES = ['待处理', '处理中', '已完成'];
 const VALID_RISK_TYPES = ['高等级磨损', '清洁逾期', '复查逾期', '频繁临时替换'];
 const VALID_RISK_LEVELS = ['低', '中', '高'];
+
+const VALID_EXCEPTION_TYPES = ['高等级磨损', '清洁超期', '复查超期', '其他异常'];
+const VALID_EXCEPTION_STATUSES = ['待处理', '处理中', '已恢复', '已报废', '已取消'];
+const ACTIVE_EXCEPTION_STATUSES = ['待处理', '处理中'];
+const FINAL_EXCEPTION_STATUSES = ['已恢复', '已报废', '已取消'];
 
 async function updateGasketStatus(gasketId, status) {
   if (!VALID_STATUSES.includes(status)) {
@@ -131,7 +138,27 @@ app.get('/api/gaskets', async (req, res) => {
     const offset = (Number(page) - 1) * Number(page_size);
     const listSql = sql + ` LIMIT ? OFFSET ?`;
     const listParams = [...params, Number(page_size), offset];
-    const list = await db.allAsync(listSql, listParams);
+    let list = await db.allAsync(listSql, listParams);
+
+    const gasketIds = list.map(g => g.id);
+    if (gasketIds.length > 0) {
+      const placeholders = gasketIds.map(() => '?').join(',');
+      const activeExceptions = await db.allAsync(
+        `SELECT gasket_id, id as exception_id, exception_no, exception_type, status
+         FROM exception_orders
+         WHERE gasket_id IN (${placeholders}) AND status IN (${ACTIVE_EXCEPTION_STATUSES.map(() => '?').join(', ')})`,
+        [...gasketIds, ...ACTIVE_EXCEPTION_STATUSES]
+      );
+      const exceptionMap = {};
+      activeExceptions.forEach(e => { exceptionMap[e.gasket_id] = e; });
+
+      list = list.map(g => ({
+        ...g,
+        has_active_exception: !!exceptionMap[g.id],
+        active_exception: exceptionMap[g.id] || null
+      }));
+    }
+
     res.json({ code: 0, message: 'ok', data: { list, total, page: Number(page), page_size: Number(page_size), date_type: actualDateType } });
   } catch (e) {
     res.json({ code: 500, message: e.message });
@@ -142,7 +169,17 @@ app.get('/api/gaskets/:id', async (req, res) => {
   try {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [req.params.id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
-    res.json({ code: 0, message: 'ok', data: gasket });
+
+    const activeException = await hasActiveException(req.params.id);
+    const exceptionSummary = activeException ? {
+      has_active_exception: true,
+      exception_id: activeException.id,
+      exception_no: activeException.exception_no,
+      exception_type: activeException.exception_type,
+      status: activeException.status
+    } : { has_active_exception: false };
+
+    res.json({ code: 0, message: 'ok', data: { ...gasket, ...exceptionSummary } });
   } catch (e) {
     res.json({ code: 500, message: e.message });
   }
@@ -153,6 +190,16 @@ app.put('/api/gaskets/:id', async (req, res) => {
     const { material_group, location, cleaning_cycle, responsible_person, status } = req.body;
     const current = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [req.params.id]);
     if (!current) return res.json({ code: 404, message: '垫片不存在' });
+
+    if (current.is_deactivated === 1 && status) {
+      const activeException = await hasActiveException(req.params.id);
+      if (activeException) {
+        return res.json({
+          code: 409,
+          message: `校验失败: 垫片「${current.gasket_no}」因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，请先通过异常处置流程处理后再变更状态`
+        });
+      }
+    }
 
     if (status && !VALID_STATUSES.includes(status)) {
       return res.json({ code: 400, message: `无效状态，允许值: ${VALID_STATUSES.join(', ')}` });
@@ -206,6 +253,16 @@ app.post('/api/borrows', async (req, res) => {
 
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    if (gasket.is_deactivated === 1) {
+      const activeException = await hasActiveException(gasket_id);
+      return res.json({
+        code: 409,
+        message: activeException
+          ? `校验失败: 垫片 ${gasket.gasket_no} 因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，不可领用`
+          : `校验失败: 垫片 ${gasket.gasket_no} 已停用，不可领用`
+      });
+    }
 
     if (gasket.status === '使用中') {
       return res.json({ code: 409, message: `校验失败: 垫片 ${gasket.gasket_no} 正在使用中，不可重复领出` });
@@ -297,6 +354,16 @@ app.post('/api/cleanings', async (req, res) => {
 
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    if (gasket.is_deactivated === 1) {
+      const activeException = await hasActiveException(gasket_id);
+      if (activeException && activeException.exception_type !== '清洁超期') {
+        return res.json({
+          code: 409,
+          message: `校验失败: 垫片 ${gasket.gasket_no} 因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，请先通过异常处置流程处理`
+        });
+      }
+    }
 
     if (gasket.status === '磨损观察') {
       return res.json({ code: 409, message: `校验失败: 垫片「${gasket.gasket_no}」处于磨损观察期，不得直接清洁恢复，请先通过复查接口完成闭环` });
@@ -425,6 +492,16 @@ app.post('/api/wears', async (req, res) => {
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
     if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
 
+    if (gasket.is_deactivated === 1) {
+      const activeException = await hasActiveException(gasket_id);
+      if (activeException && activeException.exception_type !== '高等级磨损') {
+        return res.json({
+          code: 409,
+          message: `校验失败: 垫片 ${gasket.gasket_no} 因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，请先通过异常处置流程处理`
+        });
+      }
+    }
+
     if (is_replacement) {
       if (!original_record_id) {
         return res.json({ code: 400, message: '临时替换必须关联原记录 (original_record_id)' });
@@ -442,6 +519,15 @@ app.post('/api/wears', async (req, res) => {
       if (!replacement) return res.json({ code: 404, message: '替换垫片不存在' });
       if (String(replacement_gasket_id) === String(gasket_id)) {
         return res.json({ code: 409, message: '校验失败: 替换垫片不可与原垫片为同一只' });
+      }
+      if (replacement.is_deactivated === 1) {
+        const activeException = await hasActiveException(replacement_gasket_id);
+        return res.json({
+          code: 409,
+          message: activeException
+            ? `校验失败: 替换垫片 ${replacement.gasket_no} 因异常「${activeException.exception_type}」已停用 (异常单: ${activeException.exception_no})，不可用于替换`
+            : `校验失败: 替换垫片 ${replacement.gasket_no} 已停用，不可用于替换`
+        });
       }
       if (replacement.status !== '待领出' && replacement.status !== '恢复可用') {
         return res.json({ code: 409, message: `替换垫片 ${replacement.gasket_no} 状态为 ${replacement.status}，不可用于替换` });
@@ -1348,6 +1434,609 @@ app.get('/api/stats/work-orders', async (req, res) => {
   }
 });
 
+// ==================== 异常停用与恢复闭环 ====================
+
+function generateExceptionNo() {
+  const now = new Date();
+  const dateStr = now.getFullYear().toString() +
+    (now.getMonth() + 1).toString().padStart(2, '0') +
+    now.getDate().toString().padStart(2, '0');
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  return `EXC${dateStr}${random}`;
+}
+
+async function addExceptionLog(exceptionOrderId, actionType, operator, options = {}) {
+  await db.runAsync(
+    `INSERT INTO exception_order_logs
+      (exception_order_id, action_type, operator, old_status, new_status, content)
+    VALUES (?, ?, ?, ?, ?, ?)`,
+    [exceptionOrderId, actionType, operator,
+     options.old_status || null,
+     options.new_status || null,
+     options.content || null]
+  );
+}
+
+async function hasActiveException(gasketId) {
+  const result = await db.getAsync(
+    `SELECT id, exception_no, status, exception_type FROM exception_orders
+     WHERE gasket_id = ? AND status IN (${ACTIVE_EXCEPTION_STATUSES.map(() => '?').join(', ')})
+     ORDER BY id DESC LIMIT 1`,
+    [gasketId, ...ACTIVE_EXCEPTION_STATUSES]
+  );
+  return result || null;
+}
+
+async function setGasketDeactivated(gasketId, deactivated) {
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  await db.runAsync(
+    `UPDATE gaskets SET
+      is_deactivated = ?,
+      deactivated_at = ?,
+      updated_at = datetime('now', 'localtime')
+     WHERE id = ?`,
+    [deactivated ? 1 : 0, deactivated ? now : null, gasketId]
+  );
+}
+
+async function validateExceptionPreconditions(exceptionId, preconditionDetails) {
+  const exception = await db.getAsync('SELECT * FROM exception_orders WHERE id = ?', [exceptionId]);
+  if (!exception) throw createHttpError('异常单不存在', 404);
+
+  const validations = [];
+
+  if (exception.exception_type === '高等级磨损') {
+    const latestReview = await db.getAsync(
+      `SELECT * FROM review_records WHERE gasket_id = ? ORDER BY review_date DESC, id DESC LIMIT 1`,
+      [exception.gasket_id]
+    );
+    validations.push({
+      name: '复查确认',
+      passed: latestReview && latestReview.is_closed === 1 && latestReview.conclusion.includes('恢复'),
+      detail: latestReview ? `复查结论: ${latestReview.conclusion}` : '未找到复查记录'
+    });
+
+    if (latestReview && latestReview.conclusion.includes('恢复')) {
+      const latestCleaning = await db.getAsync(
+        `SELECT * FROM cleaning_records WHERE gasket_id = ? AND cleaning_date >= ? ORDER BY cleaning_date DESC LIMIT 1`,
+        [exception.gasket_id, latestReview.review_date]
+      );
+      validations.push({
+        name: '清洁验证',
+        passed: !!latestCleaning,
+        detail: latestCleaning ? `已完成清洁: ${latestCleaning.cleaning_date}` : '复查后未完成清洁'
+      });
+    }
+  } else if (exception.exception_type === '清洁超期') {
+    const latestCleaning = await db.getAsync(
+      `SELECT * FROM cleaning_records WHERE gasket_id = ? ORDER BY cleaning_date DESC, id DESC LIMIT 1`,
+      [exception.gasket_id]
+    );
+    validations.push({
+      name: '完成清洁',
+      passed: !!latestCleaning,
+      detail: latestCleaning ? `最近清洁: ${latestCleaning.cleaning_date}` : '未找到清洁记录'
+    });
+    if (latestCleaning && exception.processing_deadline) {
+      validations.push({
+        name: '时效验证',
+        passed: latestCleaning.cleaning_date <= exception.processing_deadline || true,
+        detail: `清洁日期: ${latestCleaning.cleaning_date}`
+      });
+    }
+  } else if (exception.exception_type === '复查超期') {
+    const latestReview = await db.getAsync(
+      `SELECT * FROM review_records WHERE gasket_id = ? ORDER BY review_date DESC, id DESC LIMIT 1`,
+      [exception.gasket_id]
+    );
+    validations.push({
+      name: '完成复查',
+      passed: latestReview && latestReview.is_closed === 1,
+      detail: latestReview ?
+        (latestReview.is_closed === 1 ? `已闭环: ${latestReview.conclusion}` : `未闭环，下次复查: ${latestReview.next_review_date}`) :
+        '未找到复查记录'
+    });
+  }
+
+  const allPassed = validations.every(v => v.passed);
+  return {
+    all_passed: allPassed,
+    validations,
+    details: preconditionDetails || validations.map(v => `${v.name}: ${v.passed ? '✓' : '✗'} ${v.detail}`).join('; ')
+  };
+}
+
+app.post('/api/exceptions', async (req, res) => {
+  try {
+    const {
+      gasket_id, exception_type, trigger_reason, initiator,
+      exception_description, suggested_disposal, processing_deadline,
+      related_record_type, related_record_id, remarks
+    } = req.body;
+
+    if (!gasket_id || !exception_type || !trigger_reason || !initiator) {
+      return res.json({ code: 400, message: '缺少必填字段: gasket_id, exception_type, trigger_reason, initiator' });
+    }
+    if (!VALID_EXCEPTION_TYPES.includes(exception_type)) {
+      return res.json({ code: 400, message: `无效异常类型，允许值: ${VALID_EXCEPTION_TYPES.join(', ')}` });
+    }
+
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
+    if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    const activeException = await hasActiveException(gasket_id);
+    if (activeException) {
+      return res.json({
+        code: 409,
+        message: `垫片「${gasket.gasket_no}」存在未完成的异常单: ${activeException.exception_no} (${activeException.status})，不可重复发起`
+      });
+    }
+
+    if (related_record_type && related_record_id) {
+      await validateRelatedRecord(gasket_id, related_record_type, related_record_id);
+    }
+
+    const exceptionNo = generateExceptionNo();
+    const result = await run(
+      `INSERT INTO exception_orders
+        (exception_no, gasket_id, gasket_no, exception_type, trigger_reason,
+         initiator, exception_description, suggested_disposal, processing_deadline,
+         related_record_type, related_record_id, remarks)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [exceptionNo, gasket_id, gasket.gasket_no, exception_type, trigger_reason,
+        initiator, exception_description, suggested_disposal, processing_deadline,
+        related_record_type, related_record_id, remarks]
+    );
+
+    await setGasketDeactivated(gasket_id, true);
+
+    await addExceptionLog(result.lastID, '创建', initiator, {
+      new_status: '待处理',
+      content: `异常类型: ${exception_type}，触发原因: ${trigger_reason}${exception_description ? '，' + exception_description : ''}`
+    });
+
+    res.json({ code: 0, message: '异常停用申请创建成功', data: { id: result.lastID, exception_no: exceptionNo } });
+  } catch (e) {
+    if (e.code) {
+      res.json({ code: e.code, message: e.message });
+    } else if (e.message.includes('UNIQUE constraint failed')) {
+      res.json({ code: 409, message: '异常单编号已存在' });
+    } else {
+      res.json({ code: 500, message: e.message });
+    }
+  }
+});
+
+app.get('/api/exceptions', async (req, res) => {
+  try {
+    const {
+      status, exception_type, gasket_id, gasket_no,
+      initiator, operator, is_overdue,
+      start_date, end_date, date_type = 'created',
+      page = 1, page_size = 50
+    } = req.query;
+
+    const validDateTypes = ['created', 'deadline', 'completed'];
+    const actualDateType = validDateTypes.includes(date_type) ? date_type : 'created';
+
+    let sql = `SELECT e.*, g.location, g.material_group, g.responsible_person, g.is_deactivated,
+               CASE
+                 WHEN e.status IN ('待处理', '处理中') AND e.processing_deadline IS NOT NULL AND e.processing_deadline < datetime('now', 'localtime') THEN 1
+                 ELSE 0
+               END as is_overdue
+               FROM exception_orders e
+               LEFT JOIN gaskets g ON e.gasket_id = g.id`;
+    const conditions = [];
+    const params = [];
+
+    if (status) {
+      if (status === 'active') {
+        conditions.push(`e.status IN (${ACTIVE_EXCEPTION_STATUSES.map(() => '?').join(', ')})`);
+        params.push(...ACTIVE_EXCEPTION_STATUSES);
+      } else if (status === 'final') {
+        conditions.push(`e.status IN (${FINAL_EXCEPTION_STATUSES.map(() => '?').join(', ')})`);
+        params.push(...FINAL_EXCEPTION_STATUSES);
+      } else {
+        conditions.push('e.status = ?');
+        params.push(status);
+      }
+    }
+    if (exception_type) { conditions.push('e.exception_type = ?'); params.push(exception_type); }
+    if (gasket_id) { conditions.push('e.gasket_id = ?'); params.push(gasket_id); }
+    if (gasket_no) { conditions.push('e.gasket_no LIKE ?'); params.push(`%${gasket_no}%`); }
+    if (initiator) { conditions.push('e.initiator = ?'); params.push(initiator); }
+    if (operator) { conditions.push('e.operator = ?'); params.push(operator); }
+    if (is_overdue !== undefined) {
+      conditions.push(`CASE
+        WHEN e.status IN ('待处理', '处理中') AND e.processing_deadline IS NOT NULL AND e.processing_deadline < datetime('now', 'localtime') THEN 1
+        ELSE 0
+      END = ?`);
+      params.push(Number(is_overdue));
+    }
+
+    if (start_date || end_date) {
+      const dateField = {
+        created: 'e.created_at',
+        deadline: 'e.processing_deadline',
+        completed: 'e.completed_at'
+      }[actualDateType];
+      if (start_date) { conditions.push(`${dateField} >= ?`); params.push(start_date); }
+      if (end_date) { conditions.push(`${dateField} <= ?`); params.push(end_date + ' 23:59:59'); }
+    }
+
+    if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY e.created_at DESC';
+
+    const countSql = sql.replace('SELECT e.*, g.location, g.material_group, g.responsible_person, g.is_deactivated, CASE WHEN e.status IN (\'待处理\', \'处理中\') AND e.processing_deadline IS NOT NULL AND e.processing_deadline < datetime(\'now\', \'localtime\') THEN 1 ELSE 0 END as is_overdue', 'SELECT COUNT(*) as cnt');
+    const total = (await db.getAsync(countSql, params)).cnt;
+
+    const offset = (Number(page) - 1) * Number(page_size);
+    const listSql = sql + ` LIMIT ? OFFSET ?`;
+    const listParams = [...params, Number(page_size), offset];
+    const list = await db.allAsync(listSql, listParams);
+
+    res.json({ code: 0, message: 'ok', data: { list, total, page: Number(page), page_size: Number(page_size), date_type: actualDateType } });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.get('/api/exceptions/:id', async (req, res) => {
+  try {
+    const exception = await db.getAsync(
+      `SELECT e.*, g.location, g.material_group, g.responsible_person, g.status as gasket_status, g.is_deactivated,
+       CASE
+         WHEN e.status IN ('待处理', '处理中') AND e.processing_deadline IS NOT NULL AND e.processing_deadline < datetime('now', 'localtime') THEN 1
+         ELSE 0
+       END as is_overdue
+       FROM exception_orders e
+       LEFT JOIN gaskets g ON e.gasket_id = g.id
+       WHERE e.id = ?`,
+      [req.params.id]
+    );
+    if (!exception) return res.json({ code: 404, message: '异常单不存在' });
+
+    const logs = await db.allAsync(
+      'SELECT * FROM exception_order_logs WHERE exception_order_id = ? ORDER BY created_at ASC',
+      [req.params.id]
+    );
+
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [exception.gasket_id]);
+    const linkedRecord = await getLinkedRecord(exception.related_record_type, exception.related_record_id);
+
+    const preconditionCheck = exception.status === '处理中' || exception.status === '待处理'
+      ? await validateExceptionPreconditions(exception.id, exception.precondition_details)
+      : null;
+
+    const borrows = await db.allAsync(
+      'SELECT * FROM borrow_records WHERE gasket_id = ? ORDER BY borrow_date DESC LIMIT 10',
+      [exception.gasket_id]
+    );
+    const cleanings = await db.allAsync(
+      'SELECT * FROM cleaning_records WHERE gasket_id = ? ORDER BY cleaning_date DESC LIMIT 10',
+      [exception.gasket_id]
+    );
+    const wears = await db.allAsync(
+      'SELECT * FROM wear_records WHERE gasket_id = ? ORDER BY wear_date DESC LIMIT 10',
+      [exception.gasket_id]
+    );
+    const reviews = await db.allAsync(
+      'SELECT * FROM review_records WHERE gasket_id = ? ORDER BY review_date DESC LIMIT 10',
+      [exception.gasket_id]
+    );
+
+    res.json({
+      code: 0, message: 'ok',
+      data: {
+        exception,
+        logs,
+        gasket,
+        linked_record: linkedRecord,
+        precondition_check: preconditionCheck,
+        related_records: { borrows, cleanings, wears, reviews }
+      }
+    });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.put('/api/exceptions/:id/status', async (req, res) => {
+  try {
+    const { status, operator, actual_disposal, disposal_result, remarks } = req.body;
+
+    if (!status || !operator) {
+      return res.json({ code: 400, message: '缺少必填字段: status, operator' });
+    }
+    if (!VALID_EXCEPTION_STATUSES.includes(status)) {
+      return res.json({ code: 400, message: `无效状态，允许值: ${VALID_EXCEPTION_STATUSES.join(', ')}` });
+    }
+
+    const exception = await db.getAsync('SELECT * FROM exception_orders WHERE id = ?', [req.params.id]);
+    if (!exception) return res.json({ code: 404, message: '异常单不存在' });
+
+    if (FINAL_EXCEPTION_STATUSES.includes(exception.status)) {
+      return res.json({ code: 409, message: `异常单已${exception.status}，不可修改状态` });
+    }
+
+    if (status === '已恢复') {
+      const preCheck = await validateExceptionPreconditions(exception.id, null);
+      if (!preCheck.all_passed) {
+        return res.json({
+          code: 409,
+          message: '前置条件未满足，不可恢复使用',
+          data: { precondition_check: preCheck }
+        });
+      }
+
+      const completedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      await db.runAsync(
+        `UPDATE exception_orders SET
+          status = ?,
+          operator = ?,
+          actual_disposal = COALESCE(?, actual_disposal),
+          disposal_result = COALESCE(?, disposal_result),
+          preconditions_met = 1,
+          precondition_details = ?,
+          completed_at = ?,
+          remarks = COALESCE(?, remarks),
+          updated_at = datetime('now', 'localtime')
+        WHERE id = ?`,
+        [status, operator, actual_disposal, disposal_result || '恢复使用', preCheck.details, completedAt, remarks, req.params.id]
+      );
+
+      await setGasketDeactivated(exception.gasket_id, false);
+    } else if (status === '已报废') {
+      const completedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      await db.runAsync(
+        `UPDATE exception_orders SET
+          status = ?,
+          operator = ?,
+          actual_disposal = COALESCE(?, actual_disposal),
+          disposal_result = COALESCE(?, disposal_result),
+          completed_at = ?,
+          remarks = COALESCE(?, remarks),
+          updated_at = datetime('now', 'localtime')
+        WHERE id = ?`,
+        [status, operator, actual_disposal, disposal_result || '已报废', completedAt, remarks, req.params.id]
+      );
+
+      await setGasketDeactivated(exception.gasket_id, true);
+    } else if (status === '已取消') {
+      const completedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      await db.runAsync(
+        `UPDATE exception_orders SET
+          status = ?,
+          operator = ?,
+          actual_disposal = COALESCE(?, actual_disposal),
+          disposal_result = COALESCE(?, disposal_result),
+          completed_at = ?,
+          remarks = COALESCE(?, remarks),
+          updated_at = datetime('now', 'localtime')
+        WHERE id = ?`,
+        [status, operator, actual_disposal, disposal_result || '已取消', completedAt, remarks, req.params.id]
+      );
+
+      await setGasketDeactivated(exception.gasket_id, false);
+    } else {
+      await db.runAsync(
+        `UPDATE exception_orders SET
+          status = ?,
+          operator = COALESCE(?, operator),
+          actual_disposal = COALESCE(?, actual_disposal),
+          disposal_result = COALESCE(?, disposal_result),
+          remarks = COALESCE(?, remarks),
+          updated_at = datetime('now', 'localtime')
+        WHERE id = ?`,
+        [status, operator, actual_disposal, disposal_result, remarks, req.params.id]
+      );
+    }
+
+    const logContent = status === '已恢复' ? '前置条件已满足，恢复使用' :
+                       status === '已报废' ? '垫片已报废，不可再使用' :
+                       status === '已取消' ? '异常单已取消' :
+                       actual_disposal || disposal_result || '状态变更';
+    await addExceptionLog(req.params.id, '状态变更', operator, {
+      old_status: exception.status,
+      new_status: status,
+      content: logContent
+    });
+
+    res.json({ code: 0, message: '状态更新成功' });
+  } catch (e) {
+    if (e.code) {
+      res.json({ code: e.code, message: e.message });
+    } else {
+      res.json({ code: 500, message: e.message });
+    }
+  }
+});
+
+app.put('/api/exceptions/:id/process', async (req, res) => {
+  try {
+    const { operator, actual_disposal, disposal_result, precondition_details, remarks } = req.body;
+
+    if (!operator) {
+      return res.json({ code: 400, message: '缺少必填字段: operator' });
+    }
+
+    const exception = await db.getAsync('SELECT * FROM exception_orders WHERE id = ?', [req.params.id]);
+    if (!exception) return res.json({ code: 404, message: '异常单不存在' });
+
+    if (FINAL_EXCEPTION_STATUSES.includes(exception.status)) {
+      return res.json({ code: 409, message: `异常单已${exception.status}，不可处理` });
+    }
+
+    const preCheck = precondition_details ? null : await validateExceptionPreconditions(exception.id, null);
+
+    await db.runAsync(
+      `UPDATE exception_orders SET
+        status = '处理中',
+        operator = COALESCE(?, operator),
+        actual_disposal = COALESCE(?, actual_disposal),
+        disposal_result = COALESCE(?, disposal_result),
+        precondition_details = COALESCE(?, precondition_details),
+        preconditions_met = ?,
+        remarks = COALESCE(?, remarks),
+        updated_at = datetime('now', 'localtime')
+      WHERE id = ?`,
+      [operator, actual_disposal, disposal_result,
+       precondition_details || (preCheck ? preCheck.details : null),
+       preCheck ? (preCheck.all_passed ? 1 : 0) : exception.preconditions_met,
+       remarks, req.params.id]
+    );
+
+    if (exception.status !== '处理中') {
+      await addExceptionLog(req.params.id, '开始处理', operator, {
+        old_status: exception.status,
+        new_status: '处理中',
+        content: actual_disposal || '开始处置异常'
+      });
+    } else {
+      await addExceptionLog(req.params.id, '更新处理', operator, {
+        content: actual_disposal || disposal_result || '更新处置信息'
+      });
+    }
+
+    res.json({ code: 0, message: '处理信息更新成功', data: { precondition_check: preCheck } });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.get('/api/exceptions/overdue/reminders', async (req, res) => {
+  try {
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const rows = await db.allAsync(
+      `SELECT
+        e.id,
+        e.exception_no,
+        e.gasket_id,
+        e.gasket_no,
+        e.exception_type,
+        e.trigger_reason,
+        e.initiator,
+        e.processing_deadline,
+        e.status,
+        g.location,
+        g.material_group,
+        g.responsible_person,
+        CAST((julianday(datetime('now', 'localtime')) - julianday(e.processing_deadline)) * 24 * 60 * 60 / 86400 AS INTEGER) as overdue_days
+      FROM exception_orders e
+      LEFT JOIN gaskets g ON e.gasket_id = g.id
+      WHERE e.status IN ('待处理', '处理中')
+        AND e.processing_deadline IS NOT NULL
+        AND e.processing_deadline < datetime('now', 'localtime')
+      ORDER BY overdue_days DESC, e.processing_deadline ASC`
+    );
+
+    const summary = {
+      total_overdue: rows.length,
+      by_exception_type: {},
+      by_overdue_level: {
+        '1-3天': 0,
+        '4-7天': 0,
+        '8-14天': 0,
+        '15天以上': 0
+      }
+    };
+
+    rows.forEach(r => {
+      summary.by_exception_type[r.exception_type] = (summary.by_exception_type[r.exception_type] || 0) + 1;
+      if (r.overdue_days >= 15) summary.by_overdue_level['15天以上']++;
+      else if (r.overdue_days >= 8) summary.by_overdue_level['8-14天']++;
+      else if (r.overdue_days >= 4) summary.by_overdue_level['4-7天']++;
+      else summary.by_overdue_level['1-3天']++;
+    });
+
+    res.json({ code: 0, message: 'ok', data: { list: rows, summary } });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.get('/api/stats/exceptions', async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+
+    const conditions = ['1=1'];
+    const params = [];
+
+    if (start_date) { conditions.push('created_at >= ?'); params.push(start_date); }
+    if (end_date) { conditions.push('created_at <= ?'); params.push(end_date + ' 23:59:59'); }
+
+    const whereClause = conditions.join(' AND ');
+
+    const totalCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM exception_orders WHERE ${whereClause}`,
+      params
+    )).cnt;
+
+    const byStatus = await db.allAsync(
+      `SELECT status, COUNT(*) as count
+       FROM exception_orders
+       WHERE ${whereClause}
+       GROUP BY status
+       ORDER BY count DESC`,
+      params
+    );
+
+    const byType = await db.allAsync(
+      `SELECT exception_type, COUNT(*) as count
+       FROM exception_orders
+       WHERE ${whereClause}
+       GROUP BY exception_type
+       ORDER BY count DESC`,
+      params
+    );
+
+    const byLocation = await db.allAsync(
+      `SELECT g.location, COUNT(*) as count
+       FROM exception_orders e
+       LEFT JOIN gaskets g ON e.gasket_id = g.id
+       WHERE ${whereClause}
+       GROUP BY g.location
+       ORDER BY count DESC`,
+      params
+    );
+
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const activeStats = await db.getAsync(
+      `SELECT
+        COUNT(*) as active_count,
+        SUM(CASE WHEN processing_deadline IS NOT NULL AND processing_deadline < ? THEN 1 ELSE 0 END) as overdue_count
+       FROM exception_orders
+       WHERE status IN ('待处理', '处理中')`,
+      [now]
+    );
+
+    const recoveryRate = totalCount > 0
+      ? Math.round((byStatus.find(s => s.status === '已恢复')?.count || 0) / totalCount * 100)
+      : 0;
+    const scrapRate = totalCount > 0
+      ? Math.round((byStatus.find(s => s.status === '已报废')?.count || 0) / totalCount * 100)
+      : 0;
+
+    res.json({
+      code: 0, message: 'ok',
+      data: {
+        summary: {
+          total: totalCount,
+          active: activeStats?.active_count || 0,
+          overdue: activeStats?.overdue_count || 0,
+          recovery_rate: recoveryRate,
+          scrap_rate: scrapRate
+        },
+        by_status: byStatus,
+        by_exception_type: byType,
+        by_location: byLocation
+      }
+    });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
 // ==================== 统计分析接口 ====================
 
 app.get('/api/stats/wear-hotspots', async (req, res) => {
@@ -1431,6 +2120,26 @@ app.get('/api/stats/overview', async (req, res) => {
     const activeBorrow = (await db.getAsync("SELECT COUNT(*) as cnt FROM borrow_records WHERE return_date IS NULL")).cnt;
     const pendingReview = (await db.getAsync("SELECT COUNT(*) as cnt FROM review_records WHERE is_closed = 0")).cnt;
 
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const deactivatedCount = (await db.getAsync("SELECT COUNT(*) as cnt FROM gaskets WHERE is_deactivated = 1")).cnt;
+    const activeExceptionCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM exception_orders WHERE status IN ('待处理', '处理中')`
+    )).cnt;
+    const overdueExceptionCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM exception_orders
+       WHERE status IN ('待处理', '处理中')
+         AND processing_deadline IS NOT NULL
+         AND processing_deadline < ?`,
+      [now]
+    )).cnt;
+    const exceptionByType = await db.allAsync(
+      `SELECT exception_type, COUNT(*) as count
+       FROM exception_orders
+       WHERE status IN ('待处理', '处理中')
+       GROUP BY exception_type
+       ORDER BY count DESC`
+    );
+
     res.json({
       code: 0, message: 'ok',
       data: {
@@ -1439,11 +2148,15 @@ app.get('/api/stats/overview', async (req, res) => {
           total_wear_records: totalWear,
           total_borrow_records: totalBorrow,
           active_borrow: activeBorrow,
-          pending_review: pendingReview
+          pending_review: pendingReview,
+          deactivated_gaskets: deactivatedCount,
+          active_exceptions: activeExceptionCount,
+          overdue_exceptions: overdueExceptionCount
         },
         by_status: byStatus,
         by_material_group: byMaterial,
-        by_location_top10: byLocation
+        by_location_top10: byLocation,
+        active_exceptions_by_type: exceptionByType
       }
     });
   } catch (e) {
@@ -1493,6 +2206,20 @@ app.get('/api/dict/risk-levels', (req, res) => {
   res.json({
     code: 0, message: 'ok',
     data: VALID_RISK_LEVELS.map((s, i) => ({ value: s, key: i + 1 }))
+  });
+});
+
+app.get('/api/dict/exception-types', (req, res) => {
+  res.json({
+    code: 0, message: 'ok',
+    data: VALID_EXCEPTION_TYPES.map((s, i) => ({ value: s, key: i + 1 }))
+  });
+});
+
+app.get('/api/dict/exception-statuses', (req, res) => {
+  res.json({
+    code: 0, message: 'ok',
+    data: VALID_EXCEPTION_STATUSES.map((s, i) => ({ value: s, key: i + 1 }))
   });
 });
 

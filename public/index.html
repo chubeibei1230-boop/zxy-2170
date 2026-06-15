@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>异常停用与恢复闭环 - 垫片管理系统</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🔒 异常停用与恢复闭环管理</h1>
+      <p>垫片异常发现、停用、处置、恢复/报废全流程可追踪管理</p>
+    </div>
+
+    <div id="alert" style="display: none;"></div>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="overview" onclick="switchTab('overview')">📊 系统总览</button>
+      <button class="tab-btn" data-tab="exceptions" onclick="switchTab('exceptions')">📋 异常单管理</button>
+      <button class="tab-btn" data-tab="gaskets" onclick="switchTab('gaskets')">🔧 垫片管理</button>
+      <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">📈 统计分析</button>
+    </div>
+
+    <div id="tab-overview" class="tab-content active">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>垫片总数</h3>
+          <div class="value" id="stat-total-gaskets">-</div>
+          <div class="trend">系统总垫片数量</div>
+        </div>
+        <div class="stat-card warning">
+          <h3>使用中</h3>
+          <div class="value" id="stat-active-borrow">-</div>
+          <div class="trend">正在领用的垫片</div>
+        </div>
+        <div class="stat-card danger">
+          <h3>已停用</h3>
+          <div class="value" id="stat-deactivated">-</div>
+          <div class="trend">因异常停用的垫片</div>
+        </div>
+        <div class="stat-card warning">
+          <h3>未处理异常</h3>
+          <div class="value" id="stat-active-exceptions">-</div>
+          <div class="trend">待处理或处理中</div>
+        </div>
+        <div class="stat-card danger">
+          <h3>逾期异常</h3>
+          <div class="value" id="stat-overdue-exceptions">-</div>
+          <div class="trend">超过处理时限</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>异常单统计概览</h2>
+          <button class="btn btn-primary" onclick="openCreateModal()">+ 发起停用申请</button>
+        </div>
+        <div class="card-body">
+          <div class="summary-cards">
+            <div class="summary-card">
+              <div class="count" id="stat-exception-total">-</div>
+              <div class="label">异常单总数</div>
+            </div>
+            <div class="summary-card active">
+              <div class="count" id="stat-exception-active">-</div>
+              <div class="label">处理中</div>
+            </div>
+            <div class="summary-card overdue">
+              <div class="count" id="stat-exception-overdue">-</div>
+              <div class="label">已逾期</div>
+            </div>
+            <div class="summary-card recovered">
+              <div class="count" id="stat-recovery-rate">-</div>
+              <div class="label">恢复率</div>
+            </div>
+            <div class="summary-card scrapped">
+              <div class="count" id="stat-scrap-rate">-</div>
+              <div class="label">报废率</div>
+            </div>
+          </div>
+          <div class="chart-container">
+            <div class="card" style="margin-bottom: 0;">
+              <div class="card-body">
+                <h4>按异常类型</h4>
+                <div id="stats-by-type"></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom: 0;">
+              <div class="card-body">
+                <h4>按处理状态</h4>
+                <div id="stats-by-status"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>⚠️ 逾期异常提醒 (<span id="overdue-count">-</span>)</h2>
+        </div>
+        <div class="card-body">
+          <div class="table-container">
+            <table>
+            <thead>
+              <tr>
+                <th>异常单号</th>
+                <th>垫片编号</th>
+                <th>异常类型</th>
+                <th>点位</th>
+                <th>处理时限</th>
+                <th>逾期天数</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="overdue-list"></tbody>
+          </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-exceptions" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <h2>异常单列表</h2>
+          <button class="btn btn-primary" onclick="openCreateModal()">+ 发起停用申请</button>
+        </div>
+        <div class="card-body">
+          <div class="filters">
+            <div class="filter-group">
+              <label>处理状态</label>
+              <select id="filter-status" onchange="applyFilters()">
+                <option value="">全部</option>
+                <option value="active">未完成</option>
+                <option value="final">已完成</option>
+                <option value="待处理">待处理</option>
+                <option value="处理中">处理中</option>
+                <option value="已恢复">已恢复</option>
+                <option value="已报废">已报废</option>
+                <option value="已取消">已取消</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>异常类型</label>
+              <select id="filter-type" onchange="applyFilters()">
+                <option value="">全部</option>
+                <option value="高等级磨损">高等级磨损</option>
+                <option value="清洁超期">清洁超期</option>
+                <option value="复查超期">复查超期</option>
+                <option value="其他异常">其他异常</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>垫片编号</label>
+              <input type="text" id="filter-keyword" placeholder="搜索垫片编号" onkeyup="if(event.key==='Enter')applyFilters()">
+            </div>
+            <div class="filter-group">
+              <label>是否逾期</label>
+              <select id="filter-overdue" onchange="applyFilters()">
+                <option value="">全部</option>
+                <option value="1">已逾期</option>
+                <option value="0">未逾期</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <button class="btn btn-secondary btn-sm" onclick="applyFilters()">查询</button>
+              <button class="btn btn-secondary btn-sm" onclick="resetFilters()">重置</button>
+            </div>
+          </div>
+          <div class="table-container">
+            <table>
+            <thead>
+              <tr>
+                <th>异常单号</th>
+                <th>垫片编号</th>
+                <th>点位</th>
+                <th>异常类型</th>
+                <th>触发原因</th>
+                <th>状态</th>
+                <th>处理时限</th>
+                <th>标记</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="exception-list"></tbody>
+          </table>
+          </div>
+          <div class="pagination" id="exception-pagination"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-gaskets" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <h2>垫片列表</h2>
+          <button class="btn btn-primary" onclick="openCreateModal()">+ 发起停用申请</button>
+        </div>
+        <div class="card-body">
+          <div class="table-container">
+            <table>
+            <thead>
+              <tr>
+                <th>垫片编号</th>
+                <th>材质分组</th>
+                <th>点位</th>
+                <th>状态</th>
+                <th>责任人</th>
+                <th>异常标记</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="gasket-list"></tbody>
+          </table>
+          </div>
+          <div class="pagination" id="gasket-pagination"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-stats" class="tab-content">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>异常单总数</h3>
+          <div class="value" id="stat-s-total">-</div>
+        </div>
+        <div class="stat-card warning">
+          <h3>未完成</h3>
+          <div class="value" id="stat-s-active">-</div>
+        </div>
+        <div class="stat-card danger">
+          <h3>已逾期</h3>
+          <div class="value" id="stat-s-overdue">-</div>
+        </div>
+        <div class="stat-card success">
+          <h3>恢复率</h3>
+          <div class="value" id="stat-s-recovery">-</div>
+        </div>
+        <div class="stat-card">
+          <h3>报废率</h3>
+          <div class="value" id="stat-s-scrap">-</div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <div class="card">
+          <div class="card-body">
+            <div id="stats-chart-type"></div>
+          </div>
+          </div>
+        <div class="card">
+          <div class="card-body">
+            <div id="stats-chart-status"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div id="stats-chart-location"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="create-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>发起异常停用申请</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="create-form">
+          <div class="form-row">
+            <div class="form-group">
+              <label>选择垫片 <span class="required">*</span></label>
+              <div style="display: flex; gap: 8px;">
+                <input type="text" id="search-gasket" placeholder="输入垫片编号搜索" style="flex: 1;">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="searchGasket()">搜索</button>
+              </div>
+              <input type="hidden" id="create-gasket-id" name="gasket_id">
+              <input type="text" id="create-gasket-no" readonly placeholder="请先搜索垫片" style="margin-top: 8px;">
+            </div>
+            <div class="form-group">
+              <label>异常类型 <span class="required">*</span></label>
+              <select id="create-exception-type" name="exception_type">
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>触发原因 <span class="required">*</span></label>
+              <input type="text" name="trigger_reason" placeholder="例如：磨损等级4级、清洁逾期5天等" required>
+            </div>
+            <div class="form-group">
+              <label>发起人 <span class="required">*</span></label>
+              <input type="text" name="initiator" placeholder="请输入发起人姓名" required>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>处理时限</label>
+              <input type="datetime-local" name="processing_deadline">
+            </div>
+            <div class="form-group">
+              <label>建议处置方式</label>
+              <input type="text" name="suggested_disposal" placeholder="例如：建议复查后更换">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>异常说明</label>
+            <textarea name="exception_description" placeholder="请详细描述异常情况"></textarea>
+          </div>
+          <div class="form-group">
+            <label>备注</label>
+            <textarea name="remarks" placeholder="其他需要说明的事项"></textarea>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="hideModal('create-modal')">取消</button>
+        <button class="btn btn-primary" onclick="submitCreate()">提交申请</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="exception-detail-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>异常单详情</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="detail-section">
+          <h4>基本信息 <span id="detail-overdue"></span> <span id="detail-deactivated"></span></h4>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="label">异常单号</span>
+              <span class="value" id="detail-no">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">状态</span>
+              <span class="value" id="detail-status">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">异常类型</span>
+              <span class="value" id="detail-type">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">垫片编号</span>
+              <span class="value" id="detail-gasket">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">点位</span>
+              <span class="value" id="detail-location">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">发起人</span>
+              <span class="value" id="detail-initiator">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">处理人</span>
+              <span class="value" id="detail-operator">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">处理时限</span>
+              <span class="value" id="detail-deadline">-</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="detail-section">
+          <h4>异常信息</h4>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="label">触发原因</span>
+              <span class="value" id="detail-trigger">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">建议处置</span>
+              <span class="value" id="detail-suggested">-</span>
+            </div>
+          </div>
+          <div class="detail-item" style="margin-top: 12px;">
+            <span class="label">异常说明</span>
+            <span class="value" id="detail-description">-</span>
+          </div>
+        </div>
+
+        <div class="detail-section" id="precondition-check" style="display: none;"></div>
+
+        <div class="detail-section">
+          <h4>处置结果</h4>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="label">实际处置</span>
+              <span class="value" id="detail-actual">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">处置结论</span>
+              <span class="value" id="detail-result">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">创建时间</span>
+              <span class="value" id="detail-created">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">完成时间</span>
+              <span class="value" id="detail-completed">-</span>
+            </div>
+          </div>
+          <div class="detail-item" style="margin-top: 12px;">
+            <span class="label">备注</span>
+            <span class="value" id="detail-remarks">-</span>
+          </div>
+        </div>
+
+        <div class="detail-section">
+          <h4>操作留痕</h4>
+          <div class="log-timeline" id="exception-logs"></div>
+        </div>
+      </div>
+      <div class="modal-footer" id="detail-action-buttons"></div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="process-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>处理异常</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="process-id">
+        <div class="detail-section">
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="label">异常单号</span>
+              <span class="value" id="process-no">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">垫片编号</span>
+              <span class="value" id="process-gasket">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">异常类型</span>
+              <span class="value" id="process-type">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">触发原因</span>
+              <span class="value" id="process-trigger">-</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="process-precondition"></div>
+
+        <div class="form-group">
+          <label>处理人 <span class="required">*</span></label>
+          <input type="text" id="process-operator" placeholder="请输入处理人姓名">
+        </div>
+        <div class="form-group">
+          <label>实际处置方式</label>
+          <textarea id="process-actual" placeholder="例如：已完成复查并清洁，更换新垫片等"></textarea>
+        </div>
+        <div class="form-group">
+          <label>处置结果</label>
+          <textarea id="process-result" placeholder="例如：磨损程度可继续使用，已恢复正常"></textarea>
+        </div>
+        <div class="form-group">
+          <label>前置条件说明</label>
+          <textarea id="process-precondition-details" placeholder="可选，如已完成清洁、复查等前置条件的说明"></textarea>
+        </div>
+        <div class="form-group">
+          <label>备注</label>
+          <textarea id="process-remarks" placeholder="其他需要说明的事项"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="hideModal('process-modal')">取消</button>
+        <button class="btn btn-primary" onclick="submitProcess()">保存处理</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="gasket-detail-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>垫片详情</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="gasket-exception-banner" class="exception-banner" style="display: none;"></div>
+        <div class="detail-section">
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="label">垫片编号</span>
+              <span class="value" id="gasket-detail-no">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">材质分组</span>
+              <span class="value" id="gasket-detail-material">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">点位</span>
+              <span class="value" id="gasket-detail-location">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">状态</span>
+              <span class="value" id="gasket-detail-status">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">责任人</span>
+              <span class="value" id="gasket-detail-responsible">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">清洁周期</span>
+              <span class="value" id="gasket-detail-cycle">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">上次清洁</span>
+              <span class="value" id="gasket-detail-last-clean">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">下次清洁</span>
+              <span class="value" id="gasket-detail-next-clean">-</span>
+            </div>
+            <div class="detail-item">
+              <span class="label">创建时间</span>
+              <span class="value" id="gasket-detail-created">-</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" id="gasket-detail-actions"></div>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
