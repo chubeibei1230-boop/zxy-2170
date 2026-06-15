@@ -668,52 +668,379 @@ async function addOrderLog(orderId, actionType, operator, options = {}) {
   );
 }
 
+function getRelatedRecordConfig(relatedRecordType) {
+  return {
+    borrow: { table: 'borrow_records', idField: 'id', gasketField: 'gasket_id' },
+    cleaning: { table: 'cleaning_records', idField: 'id', gasketField: 'gasket_id' },
+    wear: { table: 'wear_records', idField: 'id', gasketField: 'gasket_id' },
+    review: { table: 'review_records', idField: 'id', gasketField: 'gasket_id' }
+  }[relatedRecordType] || null;
+}
+
+function createHttpError(message, code = 400) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function validateRelatedRecord(gasketId, relatedRecordType, relatedRecordId) {
+  if (!relatedRecordType && !relatedRecordId) return null;
+  if (!relatedRecordType || !relatedRecordId) {
+    throw createHttpError('关联业务记录需同时提供 related_record_type 和 related_record_id');
+  }
+
+  const config = getRelatedRecordConfig(relatedRecordType);
+  if (!config) {
+    throw createHttpError('无效关联记录类型，允许值: borrow, cleaning, wear, review');
+  }
+
+  const record = await db.getAsync(
+    `SELECT * FROM ${config.table} WHERE ${config.idField} = ?`,
+    [relatedRecordId]
+  );
+
+  if (!record) {
+    throw createHttpError('关联业务记录不存在', 404);
+  }
+  if (String(record[config.gasketField]) !== String(gasketId)) {
+    throw createHttpError('关联业务记录与垫片不匹配');
+  }
+
+  return record;
+}
+
+async function getLinkedRecord(relatedRecordType, relatedRecordId) {
+  if (!relatedRecordType || !relatedRecordId) return null;
+  const config = getRelatedRecordConfig(relatedRecordType);
+  if (!config) return null;
+  return db.getAsync(`SELECT * FROM ${config.table} WHERE ${config.idField} = ?`, [relatedRecordId]);
+}
+
+async function hasOpenDuplicateOrder({ risk_type, gasket_id, related_record_type, related_record_id }) {
+  const duplicate = await db.getAsync(
+    `SELECT id, order_no
+     FROM risk_work_orders
+     WHERE risk_type = ?
+       AND gasket_id = ?
+       AND COALESCE(related_record_type, '') = COALESCE(?, '')
+       AND COALESCE(related_record_id, 0) = COALESCE(?, 0)
+       AND status != '已完成'
+     ORDER BY id DESC
+     LIMIT 1`,
+    [risk_type, gasket_id, related_record_type || null, related_record_id || null]
+  );
+  return duplicate || null;
+}
+
+async function createRiskWorkOrder({
+  risk_type,
+  risk_level,
+  risk_source,
+  gasket_id,
+  related_record_type,
+  related_record_id,
+  responsible_person,
+  description,
+  operator
+}) {
+  if (!risk_type || !risk_level || !gasket_id || !responsible_person) {
+    throw createHttpError('缺少必填字段: risk_type, risk_level, gasket_id, responsible_person');
+  }
+  if (!VALID_RISK_TYPES.includes(risk_type)) {
+    throw createHttpError(`无效风险类型，允许值: ${VALID_RISK_TYPES.join(', ')}`);
+  }
+  if (!VALID_RISK_LEVELS.includes(risk_level)) {
+    throw createHttpError(`无效风险等级，允许值: ${VALID_RISK_LEVELS.join(', ')}`);
+  }
+
+  const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
+  if (!gasket) {
+    throw createHttpError('垫片不存在', 404);
+  }
+
+  await validateRelatedRecord(gasket_id, related_record_type, related_record_id);
+
+  const duplicate = await hasOpenDuplicateOrder({ risk_type, gasket_id, related_record_type, related_record_id });
+  if (duplicate) {
+    throw createHttpError(`存在未完成的同类工单: ${duplicate.order_no}`, 409);
+  }
+
+  const orderNo = generateOrderNo();
+  const result = await run(
+    `INSERT INTO risk_work_orders
+      (order_no, risk_type, risk_level, risk_source,
+       gasket_id, gasket_no, related_record_type, related_record_id,
+       responsible_person, description)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [orderNo, risk_type, risk_level, risk_source,
+      gasket_id, gasket.gasket_no, related_record_type, related_record_id,
+      responsible_person, description]
+  );
+
+  await addOrderLog(result.lastID, '创建', operator || '系统', {
+    new_status: '待处理',
+    new_responsible: responsible_person,
+    content: description || '工单创建'
+  });
+
+  return { id: result.lastID, order_no: orderNo };
+}
+
+async function getAutoDetectData() {
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+
+  const highLevelWear = await db.allAsync(
+    `SELECT
+      w.id as wear_id,
+      w.gasket_id,
+      w.gasket_no,
+      w.wear_level,
+      w.wear_position,
+      w.wear_date,
+      w.reporter,
+      w.is_replacement,
+      w.replacement_gasket_id,
+      w.replacement_gasket_no,
+      g.location,
+      g.material_group,
+      g.responsible_person
+    FROM wear_records w
+    LEFT JOIN gaskets g ON w.gasket_id = g.id
+    WHERE w.wear_level >= 4
+    ORDER BY w.wear_date DESC, w.id DESC`
+  );
+
+  const frequentReplacementRaw = await db.allAsync(
+    `SELECT
+      g.location,
+      COUNT(*) as replacement_count,
+      COUNT(DISTINCT w.gasket_id) as unique_gaskets,
+      GROUP_CONCAT(w.replacement_gasket_no, ', ') as replacement_nos,
+      MIN(w.wear_date) as first_replacement,
+      MAX(w.wear_date) as last_replacement,
+      latest.id as latest_replacement_record_id,
+      latest.gasket_id as anchor_gasket_id,
+      latest.gasket_no as anchor_gasket_no,
+      g.material_group,
+      g.responsible_person
+    FROM wear_records w
+    LEFT JOIN gaskets g ON w.gasket_id = g.id
+    LEFT JOIN wear_records latest ON latest.id = (
+      SELECT w2.id
+      FROM wear_records w2
+      LEFT JOIN gaskets g2 ON w2.gasket_id = g2.id
+      WHERE w2.is_replacement = 1 AND g2.location = g.location
+      ORDER BY w2.wear_date DESC, w2.id DESC
+      LIMIT 1
+    )
+    WHERE w.is_replacement = 1
+    GROUP BY g.location
+    HAVING replacement_count >= 2
+    ORDER BY replacement_count DESC`
+  );
+  const frequentReplacement = frequentReplacementRaw.map(row => {
+    if (row.replacement_nos) {
+      const unique = [...new Set(row.replacement_nos.split(', '))];
+      row.replacement_nos = unique.join(', ');
+    }
+    return row;
+  });
+
+  const cleaningTimeout = await db.allAsync(
+    `SELECT
+      g.id,
+      g.gasket_no,
+      g.location,
+      g.material_group,
+      g.responsible_person,
+      g.cleaning_cycle,
+      g.last_cleaning_date,
+      g.next_cleaning_date,
+      g.status,
+      c.id as latest_cleaning_record_id,
+      CAST((julianday(?) - julianday(g.next_cleaning_date)) * 24 * 60 * 60 / 86400 AS INTEGER) as days_overdue
+    FROM gaskets g
+    LEFT JOIN cleaning_records c ON c.id = (
+      SELECT c2.id
+      FROM cleaning_records c2
+      WHERE c2.gasket_id = g.id
+      ORDER BY c2.cleaning_date DESC, c2.id DESC
+      LIMIT 1
+    )
+    WHERE g.next_cleaning_date IS NOT NULL
+      AND g.next_cleaning_date < ?
+      AND g.status NOT IN ('待领出', '磨损观察')
+    ORDER BY days_overdue DESC`,
+    [now, now]
+  );
+
+  const missingReviewConclusion = await db.allAsync(
+    `SELECT
+      r.id as review_id,
+      r.gasket_id,
+      r.gasket_no,
+      r.wear_record_id,
+      r.review_date,
+      r.reviewer,
+      r.next_review_date,
+      g.location,
+      g.material_group,
+      g.responsible_person,
+      CAST((julianday(?) - julianday(r.next_review_date)) * 24 * 60 * 60 / 86400 AS INTEGER) as days_missing
+    FROM review_records r
+    LEFT JOIN gaskets g ON r.gasket_id = g.id
+    WHERE r.is_closed = 0
+      AND r.next_review_date IS NOT NULL
+      AND r.next_review_date < ?
+    ORDER BY days_missing DESC`,
+    [now, now]
+  );
+
+  return {
+    high_level_wear: {
+      count: highLevelWear.length,
+      description: '磨损等级>=4的高风险垫片',
+      items: highLevelWear
+    },
+    frequent_replacement_locations: {
+      count: frequentReplacement.length,
+      description: '临时替换次数>=2的点位',
+      items: frequentReplacement
+    },
+    cleaning_timeout: {
+      count: cleaningTimeout.length,
+      description: '清洁周期超时未清洁的垫片',
+      items: cleaningTimeout
+    },
+    missing_review_conclusion: {
+      count: missingReviewConclusion.length,
+      description: '复查结论长期缺失（超过约定复查日期未闭环）',
+      items: missingReviewConclusion
+    }
+  };
+}
+
+async function buildWorkOrderPayloadFromRisk(body) {
+  const { risk_type, operator } = body;
+  if (!risk_type) {
+    throw createHttpError('缺少必填字段: risk_type');
+  }
+
+  if (risk_type === '高等级磨损') {
+    const wearId = body.related_record_id || body.wear_id;
+    if (!wearId) throw createHttpError('高等级磨损生成工单需提供 wear_id 或 related_record_id');
+    const wear = await db.getAsync('SELECT * FROM wear_records WHERE id = ?', [wearId]);
+    if (!wear) throw createHttpError('磨损记录不存在', 404);
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [wear.gasket_id]);
+    return {
+      risk_type,
+      risk_level: body.risk_level || '高',
+      risk_source: body.risk_source || '自动识别-高等级磨损',
+      gasket_id: wear.gasket_id,
+      related_record_type: 'wear',
+      related_record_id: wear.id,
+      responsible_person: body.responsible_person || (gasket && gasket.responsible_person),
+      description: body.description || `垫片磨损等级${wear.wear_level}，需尽快处置`,
+      operator
+    };
+  }
+
+  if (risk_type === '清洁逾期') {
+    const gasketId = body.gasket_id;
+    if (!gasketId) throw createHttpError('清洁逾期生成工单需提供 gasket_id');
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasketId]);
+    if (!gasket) throw createHttpError('垫片不存在', 404);
+    const latestCleaning = await db.getAsync(
+      'SELECT * FROM cleaning_records WHERE gasket_id = ? ORDER BY cleaning_date DESC, id DESC LIMIT 1',
+      [gasketId]
+    );
+    return {
+      risk_type,
+      risk_level: body.risk_level || '中',
+      risk_source: body.risk_source || '自动识别-清洁逾期',
+      gasket_id: gasketId,
+      related_record_type: latestCleaning ? 'cleaning' : null,
+      related_record_id: latestCleaning ? latestCleaning.id : null,
+      responsible_person: body.responsible_person || gasket.responsible_person,
+      description: body.description || `垫片清洁已逾期，当前状态为${gasket.status}`,
+      operator
+    };
+  }
+
+  if (risk_type === '复查逾期') {
+    const reviewId = body.related_record_id || body.review_id;
+    if (!reviewId) throw createHttpError('复查逾期生成工单需提供 review_id 或 related_record_id');
+    const review = await db.getAsync('SELECT * FROM review_records WHERE id = ?', [reviewId]);
+    if (!review) throw createHttpError('复查记录不存在', 404);
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [review.gasket_id]);
+    return {
+      risk_type,
+      risk_level: body.risk_level || '高',
+      risk_source: body.risk_source || '自动识别-复查逾期',
+      gasket_id: review.gasket_id,
+      related_record_type: 'review',
+      related_record_id: review.id,
+      responsible_person: body.responsible_person || (gasket && gasket.responsible_person),
+      description: body.description || '复查已逾期，请尽快闭环处理',
+      operator
+    };
+  }
+
+  if (risk_type === '频繁临时替换') {
+    const location = body.location;
+    if (!location) throw createHttpError('频繁临时替换生成工单需提供 location');
+    const wear = await db.getAsync(
+      `SELECT w.*, g.responsible_person
+       FROM wear_records w
+       LEFT JOIN gaskets g ON w.gasket_id = g.id
+       WHERE w.is_replacement = 1
+         AND g.location = ?
+       ORDER BY w.wear_date DESC, w.id DESC
+       LIMIT 1`,
+      [location]
+    );
+    if (!wear) throw createHttpError('该点位不存在可关联的临时替换记录', 404);
+    return {
+      risk_type,
+      risk_level: body.risk_level || '高',
+      risk_source: body.risk_source || '自动识别-频繁临时替换',
+      gasket_id: wear.gasket_id,
+      related_record_type: 'wear',
+      related_record_id: wear.id,
+      responsible_person: body.responsible_person || wear.responsible_person,
+      description: body.description || `点位${location}存在频繁临时替换风险，请排查原因`,
+      operator
+    };
+  }
+
+  throw createHttpError(`暂不支持的风险类型: ${risk_type}`);
+}
+
 app.post('/api/work-orders', async (req, res) => {
   try {
-    const {
-      risk_type, risk_level, risk_source,
-      gasket_id, related_record_type, related_record_id,
-      responsible_person, description, operator
-    } = req.body;
-
-    if (!risk_type || !risk_level || !gasket_id || !responsible_person) {
-      return res.json({ code: 400, message: '缺少必填字段: risk_type, risk_level, gasket_id, responsible_person' });
-    }
-    if (!VALID_RISK_TYPES.includes(risk_type)) {
-      return res.json({ code: 400, message: `无效风险类型，允许值: ${VALID_RISK_TYPES.join(', ')}` });
-    }
-    if (!VALID_RISK_LEVELS.includes(risk_level)) {
-      return res.json({ code: 400, message: `无效风险等级，允许值: ${VALID_RISK_LEVELS.join(', ')}` });
-    }
-
-    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
-    if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
-
-    const orderNo = generateOrderNo();
-
-    const result = await run(
-      `INSERT INTO risk_work_orders
-        (order_no, risk_type, risk_level, risk_source,
-         gasket_id, gasket_no, related_record_type, related_record_id,
-         responsible_person, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [orderNo, risk_type, risk_level, risk_source,
-       gasket_id, gasket.gasket_no, related_record_type, related_record_id,
-       responsible_person, description]
-    );
-
-    await addOrderLog(result.lastID, '创建', operator || '系统', {
-      new_status: '待处理',
-      new_responsible: responsible_person,
-      content: description || '工单创建'
-    });
-
-    res.json({ code: 0, message: '工单创建成功', data: { id: result.lastID, order_no: orderNo } });
+    const data = await createRiskWorkOrder(req.body);
+    res.json({ code: 0, message: '工单创建成功', data });
   } catch (e) {
-    if (e.message.includes('UNIQUE constraint failed')) {
+    if (e.code) {
+      res.json({ code: e.code, message: e.message });
+    } else if (e.message.includes('UNIQUE constraint failed')) {
       res.json({ code: 409, message: '工单编号已存在' });
     } else {
       res.json({ code: 500, message: e.message });
+    }
+  }
+});
+
+app.post('/api/work-orders/generate', async (req, res) => {
+  try {
+    const payload = await buildWorkOrderPayloadFromRisk(req.body);
+    const data = await createRiskWorkOrder(payload);
+    res.json({ code: 0, message: '工单生成成功', data });
+  } catch (e) {
+    if (e.code) {
+      res.json({ code: e.code, message: e.message });
+    } else {
+      res.json({ code: 400, message: e.message });
     }
   }
 });
@@ -781,6 +1108,7 @@ app.get('/api/work-orders/:id', async (req, res) => {
     );
 
     const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [order.gasket_id]);
+    const linkedRecord = await getLinkedRecord(order.related_record_type, order.related_record_id);
 
     const borrows = await db.allAsync(
       'SELECT * FROM borrow_records WHERE gasket_id = ? ORDER BY borrow_date DESC LIMIT 10',
@@ -808,6 +1136,7 @@ app.get('/api/work-orders/:id', async (req, res) => {
         order,
         logs,
         gasket,
+        linked_record: linkedRecord,
         related_records: {
           borrows,
           cleanings,
@@ -1075,124 +1404,10 @@ app.get('/api/stats/wear-hotspots', async (req, res) => {
 
 app.get('/api/stats/auto-detect', async (req, res) => {
   try {
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-
-    const sameMaterialConsecutiveWear = await db.allAsync(
-      `SELECT
-        g.material_group,
-        w1.gasket_id as gasket_id_1,
-        g1.gasket_no as gasket_no_1,
-        w2.gasket_id as gasket_id_2,
-        g2.gasket_no as gasket_no_2,
-        w1.wear_date as date_1,
-        w2.wear_date as date_2,
-        w1.wear_level as level_1,
-        w2.wear_level as level_2,
-        CAST((julianday(w2.wear_date) - julianday(w1.wear_date)) * 24 * 60 * 60 / 86400 AS INTEGER) as days_apart
-      FROM wear_records w1
-      LEFT JOIN wear_records w2
-        ON w1.id < w2.id
-        AND w1.wear_position = w2.wear_position
-        AND w1.is_replacement = 0 AND w2.is_replacement = 0
-      LEFT JOIN gaskets g1 ON w1.gasket_id = g1.id
-      LEFT JOIN gaskets g2 ON w2.gasket_id = g2.id
-      LEFT JOIN gaskets g ON g.material_group = g1.material_group
-      WHERE g1.material_group = g2.material_group
-        AND w1.gasket_id != w2.gasket_id
-        AND CAST((julianday(w2.wear_date) - julianday(w1.wear_date)) * 24 * 60 * 60 / 86400 AS INTEGER) <= 30
-        AND w1.wear_level >= 3 AND w2.wear_level >= 3
-      GROUP BY g.material_group, w1.gasket_id, w2.gasket_id
-      ORDER BY days_apart ASC`
-    );
-
-    const frequentReplacementRaw = await db.allAsync(
-      `SELECT
-        g.location,
-        COUNT(*) as replacement_count,
-        COUNT(DISTINCT w.gasket_id) as unique_gaskets,
-        GROUP_CONCAT(w.replacement_gasket_no, ', ') as replacement_nos,
-        MIN(w.wear_date) as first_replacement,
-        MAX(w.wear_date) as last_replacement
-      FROM wear_records w
-      LEFT JOIN gaskets g ON w.gasket_id = g.id
-      WHERE w.is_replacement = 1
-      GROUP BY g.location
-      HAVING replacement_count >= 2
-      ORDER BY replacement_count DESC`
-    );
-    const frequentReplacement = frequentReplacementRaw.map(row => {
-      if (row.replacement_nos) {
-        const unique = [...new Set(row.replacement_nos.split(', '))];
-        row.replacement_nos = unique.join(', ');
-      }
-      return row;
-    });
-
-    const cleaningTimeout = await db.allAsync(
-      `SELECT
-        g.id,
-        g.gasket_no,
-        g.location,
-        g.material_group,
-        g.responsible_person,
-        g.cleaning_cycle,
-        g.last_cleaning_date,
-        g.next_cleaning_date,
-        g.status,
-        CAST((julianday(?) - julianday(g.next_cleaning_date)) * 24 * 60 * 60 / 86400 AS INTEGER) as days_overdue
-      FROM gaskets g
-      WHERE g.next_cleaning_date IS NOT NULL
-        AND g.next_cleaning_date < ?
-        AND g.status NOT IN ('待领出', '磨损观察')
-      ORDER BY days_overdue DESC`,
-      [now, now]
-    );
-
-    const missingReviewConclusion = await db.allAsync(
-      `SELECT
-        r.id as review_id,
-        r.gasket_id,
-        r.gasket_no,
-        r.wear_record_id,
-        r.review_date,
-        r.reviewer,
-        r.next_review_date,
-        g.location,
-        g.responsible_person,
-        CAST((julianday(?) - julianday(r.next_review_date)) * 24 * 60 * 60 / 86400 AS INTEGER) as days_missing
-      FROM review_records r
-      LEFT JOIN gaskets g ON r.gasket_id = g.id
-      WHERE r.is_closed = 0
-        AND r.next_review_date IS NOT NULL
-        AND r.next_review_date < ?
-      ORDER BY days_missing DESC`,
-      [now, now]
-    );
-
+    const data = await getAutoDetectData();
     res.json({
       code: 0, message: '自动识别分析完成',
-      data: {
-        same_material_consecutive_wear: {
-          count: sameMaterialConsecutiveWear.length,
-          description: '同材质同位置30天内连续出现≥3级磨损',
-          items: sameMaterialConsecutiveWear
-        },
-        frequent_replacement_locations: {
-          count: frequentReplacement.length,
-          description: '临时替换次数≥2的点位',
-          items: frequentReplacement
-        },
-        cleaning_timeout: {
-          count: cleaningTimeout.length,
-          description: '清洁周期超时未清洁的垫片',
-          items: cleaningTimeout
-        },
-        missing_review_conclusion: {
-          count: missingReviewConclusion.length,
-          description: '复查结论长期缺失（超过约定复查日期未闭环）',
-          items: missingReviewConclusion
-        }
-      }
+      data
     });
   } catch (e) {
     res.json({ code: 500, message: e.message });
