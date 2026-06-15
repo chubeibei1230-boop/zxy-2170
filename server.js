@@ -12,6 +12,10 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 const VALID_STATUSES = ['待领出', '使用中', '待清洁', '待复查', '恢复可用', '磨损观察'];
 
+const VALID_ORDER_STATUSES = ['待处理', '处理中', '已完成'];
+const VALID_RISK_TYPES = ['高等级磨损', '清洁逾期', '复查逾期', '频繁临时替换'];
+const VALID_RISK_LEVELS = ['低', '中', '高'];
+
 async function updateGasketStatus(gasketId, status) {
   if (!VALID_STATUSES.includes(status)) {
     throw new Error(`无效状态: ${status}，允许值: ${VALID_STATUSES.join(', ')}`);
@@ -639,6 +643,382 @@ app.get('/api/reviews/pending', async (req, res) => {
   }
 });
 
+// ==================== 风险处置工单接口 ====================
+
+function generateOrderNo() {
+  const now = new Date();
+  const dateStr = now.getFullYear().toString() +
+    (now.getMonth() + 1).toString().padStart(2, '0') +
+    now.getDate().toString().padStart(2, '0');
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  return `WO${dateStr}${random}`;
+}
+
+async function addOrderLog(orderId, actionType, operator, options = {}) {
+  await db.runAsync(
+    `INSERT INTO risk_work_order_logs
+      (order_id, action_type, operator, old_status, new_status, old_responsible, new_responsible, content)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [orderId, actionType, operator,
+     options.old_status || null,
+     options.new_status || null,
+     options.old_responsible || null,
+     options.new_responsible || null,
+     options.content || null]
+  );
+}
+
+app.post('/api/work-orders', async (req, res) => {
+  try {
+    const {
+      risk_type, risk_level, risk_source,
+      gasket_id, related_record_type, related_record_id,
+      responsible_person, description, operator
+    } = req.body;
+
+    if (!risk_type || !risk_level || !gasket_id || !responsible_person) {
+      return res.json({ code: 400, message: '缺少必填字段: risk_type, risk_level, gasket_id, responsible_person' });
+    }
+    if (!VALID_RISK_TYPES.includes(risk_type)) {
+      return res.json({ code: 400, message: `无效风险类型，允许值: ${VALID_RISK_TYPES.join(', ')}` });
+    }
+    if (!VALID_RISK_LEVELS.includes(risk_level)) {
+      return res.json({ code: 400, message: `无效风险等级，允许值: ${VALID_RISK_LEVELS.join(', ')}` });
+    }
+
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [gasket_id]);
+    if (!gasket) return res.json({ code: 404, message: '垫片不存在' });
+
+    const orderNo = generateOrderNo();
+
+    const result = await run(
+      `INSERT INTO risk_work_orders
+        (order_no, risk_type, risk_level, risk_source,
+         gasket_id, gasket_no, related_record_type, related_record_id,
+         responsible_person, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [orderNo, risk_type, risk_level, risk_source,
+       gasket_id, gasket.gasket_no, related_record_type, related_record_id,
+       responsible_person, description]
+    );
+
+    await addOrderLog(result.lastID, '创建', operator || '系统', {
+      new_status: '待处理',
+      new_responsible: responsible_person,
+      content: description || '工单创建'
+    });
+
+    res.json({ code: 0, message: '工单创建成功', data: { id: result.lastID, order_no: orderNo } });
+  } catch (e) {
+    if (e.message.includes('UNIQUE constraint failed')) {
+      res.json({ code: 409, message: '工单编号已存在' });
+    } else {
+      res.json({ code: 500, message: e.message });
+    }
+  }
+});
+
+app.get('/api/work-orders', async (req, res) => {
+  try {
+    const {
+      status, responsible_person, risk_type,
+      location, material_group,
+      start_date, end_date, date_type = 'created',
+      page = 1, page_size = 50
+    } = req.query;
+
+    const validDateTypes = ['created', 'completed'];
+    const actualDateType = validDateTypes.includes(date_type) ? date_type : 'created';
+
+    let sql = `SELECT w.*, g.location, g.material_group FROM risk_work_orders w
+               LEFT JOIN gaskets g ON w.gasket_id = g.id`;
+    const conditions = [];
+    const params = [];
+
+    if (status) { conditions.push('w.status = ?'); params.push(status); }
+    if (responsible_person) { conditions.push('w.responsible_person = ?'); params.push(responsible_person); }
+    if (risk_type) { conditions.push('w.risk_type = ?'); params.push(risk_type); }
+    if (location) { conditions.push('g.location = ?'); params.push(location); }
+    if (material_group) { conditions.push('g.material_group = ?'); params.push(material_group); }
+
+    if (start_date || end_date) {
+      const dateField = actualDateType === 'completed' ? 'w.completed_at' : 'w.created_at';
+      if (start_date) { conditions.push(`${dateField} >= ?`); params.push(start_date); }
+      if (end_date) { conditions.push(`${dateField} <= ?`); params.push(end_date + ' 23:59:59'); }
+    }
+
+    if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY w.created_at DESC';
+
+    const countSql = sql.replace('SELECT w.*, g.location, g.material_group', 'SELECT COUNT(*) as cnt');
+    const total = (await db.getAsync(countSql, params)).cnt;
+
+    const offset = (Number(page) - 1) * Number(page_size);
+    const listSql = sql + ` LIMIT ? OFFSET ?`;
+    const listParams = [...params, Number(page_size), offset];
+    const list = await db.allAsync(listSql, listParams);
+
+    res.json({ code: 0, message: 'ok', data: { list, total, page: Number(page), page_size: Number(page_size), date_type: actualDateType } });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.get('/api/work-orders/:id', async (req, res) => {
+  try {
+    const order = await db.getAsync(
+      `SELECT w.*, g.location, g.material_group, g.cleaning_cycle, g.status as gasket_status
+       FROM risk_work_orders w
+       LEFT JOIN gaskets g ON w.gasket_id = g.id
+       WHERE w.id = ?`,
+      [req.params.id]
+    );
+    if (!order) return res.json({ code: 404, message: '工单不存在' });
+
+    const logs = await db.allAsync(
+      'SELECT * FROM risk_work_order_logs WHERE order_id = ? ORDER BY created_at ASC',
+      [req.params.id]
+    );
+
+    const gasket = await db.getAsync('SELECT * FROM gaskets WHERE id = ?', [order.gasket_id]);
+
+    const borrows = await db.allAsync(
+      'SELECT * FROM borrow_records WHERE gasket_id = ? ORDER BY borrow_date DESC LIMIT 10',
+      [order.gasket_id]
+    );
+
+    const cleanings = await db.allAsync(
+      'SELECT * FROM cleaning_records WHERE gasket_id = ? ORDER BY cleaning_date DESC LIMIT 10',
+      [order.gasket_id]
+    );
+
+    const wears = await db.allAsync(
+      'SELECT * FROM wear_records WHERE gasket_id = ? ORDER BY wear_date DESC LIMIT 10',
+      [order.gasket_id]
+    );
+
+    const reviews = await db.allAsync(
+      'SELECT * FROM review_records WHERE gasket_id = ? ORDER BY review_date DESC LIMIT 10',
+      [order.gasket_id]
+    );
+
+    res.json({
+      code: 0, message: 'ok',
+      data: {
+        order,
+        logs,
+        gasket,
+        related_records: {
+          borrows,
+          cleanings,
+          wears,
+          reviews
+        }
+      }
+    });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.put('/api/work-orders/:id/status', async (req, res) => {
+  try {
+    const { status, handling_notes, operator, conclusion } = req.body;
+
+    if (!status || !operator) {
+      return res.json({ code: 400, message: '缺少必填字段: status, operator' });
+    }
+    if (!VALID_ORDER_STATUSES.includes(status)) {
+      return res.json({ code: 400, message: `无效状态，允许值: ${VALID_ORDER_STATUSES.join(', ')}` });
+    }
+
+    const order = await db.getAsync('SELECT * FROM risk_work_orders WHERE id = ?', [req.params.id]);
+    if (!order) return res.json({ code: 404, message: '工单不存在' });
+
+    if (order.status === '已完成') {
+      return res.json({ code: 409, message: '工单已完成，不可修改状态' });
+    }
+
+    if (status === '已完成' && !conclusion) {
+      return res.json({ code: 400, message: '标记已完成需填写处置结论 (conclusion)' });
+    }
+
+    const completedAt = status === '已完成' ? new Date().toISOString().replace('T', ' ').substring(0, 19) : null;
+
+    await db.runAsync(
+      `UPDATE risk_work_orders SET
+        status = ?,
+        handling_notes = COALESCE(?, handling_notes),
+        conclusion = COALESCE(?, conclusion),
+        completed_at = COALESCE(?, completed_at),
+        updated_at = datetime('now', 'localtime')
+      WHERE id = ?`,
+      [status, handling_notes, conclusion, completedAt, req.params.id]
+    );
+
+    await addOrderLog(req.params.id, '状态变更', operator, {
+      old_status: order.status,
+      new_status: status,
+      content: handling_notes || (status === '已完成' ? conclusion : '')
+    });
+
+    res.json({ code: 0, message: '状态更新成功' });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.put('/api/work-orders/:id/responsible', async (req, res) => {
+  try {
+    const { responsible_person, operator, handling_notes } = req.body;
+
+    if (!responsible_person || !operator) {
+      return res.json({ code: 400, message: '缺少必填字段: responsible_person, operator' });
+    }
+
+    const order = await db.getAsync('SELECT * FROM risk_work_orders WHERE id = ?', [req.params.id]);
+    if (!order) return res.json({ code: 404, message: '工单不存在' });
+
+    if (order.status === '已完成') {
+      return res.json({ code: 409, message: '工单已完成，不可调整责任人' });
+    }
+
+    await db.runAsync(
+      `UPDATE risk_work_orders SET
+        responsible_person = ?,
+        handling_notes = COALESCE(?, handling_notes),
+        updated_at = datetime('now', 'localtime')
+      WHERE id = ?`,
+      [responsible_person, handling_notes, req.params.id]
+    );
+
+    await addOrderLog(req.params.id, '责任人调整', operator, {
+      old_responsible: order.responsible_person,
+      new_responsible: responsible_person,
+      content: handling_notes || ''
+    });
+
+    res.json({ code: 0, message: '责任人调整成功' });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.put('/api/work-orders/:id/notes', async (req, res) => {
+  try {
+    const { handling_notes, operator } = req.body;
+
+    if (!handling_notes || !operator) {
+      return res.json({ code: 400, message: '缺少必填字段: handling_notes, operator' });
+    }
+
+    const order = await db.getAsync('SELECT * FROM risk_work_orders WHERE id = ?', [req.params.id]);
+    if (!order) return res.json({ code: 404, message: '工单不存在' });
+
+    if (order.status === '已完成') {
+      return res.json({ code: 409, message: '工单已完成，不可更新处置说明' });
+    }
+
+    await db.runAsync(
+      `UPDATE risk_work_orders SET
+        handling_notes = ?,
+        updated_at = datetime('now', 'localtime')
+      WHERE id = ?`,
+      [handling_notes, req.params.id]
+    );
+
+    await addOrderLog(req.params.id, '更新处置说明', operator, {
+      content: handling_notes
+    });
+
+    res.json({ code: 0, message: '处置说明更新成功' });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+app.get('/api/stats/work-orders', async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+
+    const conditions = ['1=1'];
+    const params = [];
+
+    if (start_date) { conditions.push('created_at >= ?'); params.push(start_date); }
+    if (end_date) { conditions.push('created_at <= ?'); params.push(end_date + ' 23:59:59'); }
+
+    const whereClause = conditions.join(' AND ');
+
+    const totalCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM risk_work_orders WHERE ${whereClause}`,
+      params
+    )).cnt;
+
+    const pendingCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM risk_work_orders WHERE status = '待处理' AND ${whereClause}`,
+      params
+    )).cnt;
+
+    const processingCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM risk_work_orders WHERE status = '处理中' AND ${whereClause}`,
+      params
+    )).cnt;
+
+    const completedCount = (await db.getAsync(
+      `SELECT COUNT(*) as cnt FROM risk_work_orders WHERE status = '已完成' AND ${whereClause}`,
+      params
+    )).cnt;
+
+    const byRiskType = await db.allAsync(
+      `SELECT risk_type, COUNT(*) as count
+       FROM risk_work_orders
+       WHERE ${whereClause}
+       GROUP BY risk_type
+       ORDER BY count DESC`,
+      params
+    );
+
+    const byResponsible = await db.allAsync(
+      `SELECT responsible_person,
+        COUNT(*) as total_count,
+        SUM(CASE WHEN status = '待处理' THEN 1 ELSE 0 END) as pending_count,
+        SUM(CASE WHEN status = '处理中' THEN 1 ELSE 0 END) as processing_count,
+        SUM(CASE WHEN status = '已完成' THEN 1 ELSE 0 END) as completed_count
+       FROM risk_work_orders
+       WHERE ${whereClause}
+       GROUP BY responsible_person
+       ORDER BY total_count DESC`,
+      params
+    );
+
+    const byRiskLevel = await db.allAsync(
+      `SELECT risk_level, COUNT(*) as count
+       FROM risk_work_orders
+       WHERE ${whereClause}
+       GROUP BY risk_level
+       ORDER BY count DESC`,
+      params
+    );
+
+    res.json({
+      code: 0, message: 'ok',
+      data: {
+        summary: {
+          total: totalCount,
+          pending: pendingCount,
+          processing: processingCount,
+          completed: completedCount
+        },
+        by_risk_type: byRiskType,
+        by_risk_level: byRiskLevel,
+        by_responsible: byResponsible
+      }
+    });
+  } catch (e) {
+    res.json({ code: 500, message: e.message });
+  }
+});
+
 // ==================== 统计分析接口 ====================
 
 app.get('/api/stats/wear-hotspots', async (req, res) => {
@@ -878,6 +1258,27 @@ app.get('/api/dict/locations', async (req, res) => {
 app.get('/api/dict/responsible-persons', async (req, res) => {
   const rows = await db.allAsync('SELECT DISTINCT responsible_person as value FROM gaskets ORDER BY responsible_person');
   res.json({ code: 0, message: 'ok', data: rows });
+});
+
+app.get('/api/dict/work-order-statuses', (req, res) => {
+  res.json({
+    code: 0, message: 'ok',
+    data: VALID_ORDER_STATUSES.map((s, i) => ({ value: s, key: i + 1 }))
+  });
+});
+
+app.get('/api/dict/risk-types', (req, res) => {
+  res.json({
+    code: 0, message: 'ok',
+    data: VALID_RISK_TYPES.map((s, i) => ({ value: s, key: i + 1 }))
+  });
+});
+
+app.get('/api/dict/risk-levels', (req, res) => {
+  res.json({
+    code: 0, message: 'ok',
+    data: VALID_RISK_LEVELS.map((s, i) => ({ value: s, key: i + 1 }))
+  });
 });
 
 app.use((err, req, res, next) => {

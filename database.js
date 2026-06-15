@@ -114,6 +114,41 @@ async function initDatabase() {
       FOREIGN KEY (wear_record_id) REFERENCES wear_records(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS risk_work_orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_no TEXT UNIQUE NOT NULL,
+      risk_type TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      risk_source TEXT,
+      gasket_id INTEGER NOT NULL,
+      gasket_no TEXT NOT NULL,
+      related_record_type TEXT,
+      related_record_id INTEGER,
+      responsible_person TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT '待处理',
+      description TEXT,
+      handling_notes TEXT,
+      conclusion TEXT,
+      completed_at TEXT,
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (gasket_id) REFERENCES gaskets(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS risk_work_order_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id INTEGER NOT NULL,
+      action_type TEXT NOT NULL,
+      operator TEXT NOT NULL,
+      old_status TEXT,
+      new_status TEXT,
+      old_responsible TEXT,
+      new_responsible TEXT,
+      content TEXT,
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (order_id) REFERENCES risk_work_orders(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_gaskets_status ON gaskets(status);
     CREATE INDEX IF NOT EXISTS idx_gaskets_material ON gaskets(material_group);
     CREATE INDEX IF NOT EXISTS idx_gaskets_location ON gaskets(location);
@@ -123,6 +158,12 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_wear_level ON wear_records(wear_level);
     CREATE INDEX IF NOT EXISTS idx_review_wear ON review_records(wear_record_id);
     CREATE INDEX IF NOT EXISTS idx_review_closed ON review_records(is_closed);
+    CREATE INDEX IF NOT EXISTS idx_work_order_status ON risk_work_orders(status);
+    CREATE INDEX IF NOT EXISTS idx_work_order_risk_type ON risk_work_orders(risk_type);
+    CREATE INDEX IF NOT EXISTS idx_work_order_risk_level ON risk_work_orders(risk_level);
+    CREATE INDEX IF NOT EXISTS idx_work_order_responsible ON risk_work_orders(responsible_person);
+    CREATE INDEX IF NOT EXISTS idx_work_order_gasket ON risk_work_orders(gasket_id);
+    CREATE INDEX IF NOT EXISTS idx_work_order_log_order ON risk_work_order_logs(order_id);
   `;
 
   await db.execAsync(initSql);
